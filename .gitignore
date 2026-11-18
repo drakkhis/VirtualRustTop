@@ -1,0 +1,6 @@
+/target/
+*.av1
+*.log
+*.apk
+*.idsig
+.DS_Store

@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vdesk-protocol",
+    "crates/vdesk-host",
+    "crates/vdesk-quest",
+]
+default-members = [
+    "crates/vdesk-protocol",
+    "crates/vdesk-host",
+    "crates/vdesk-quest",
+]
+
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

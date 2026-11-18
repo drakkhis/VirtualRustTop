@@ -1,0 +1,88 @@
+[package]
+name = "vdesk-quest"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vdesk-protocol = { path = "../vdesk-protocol" }
+openxr = { version = "0.19", features = ["mint"] }
+ash = "0.38"
+glam = "0.29"
+quinn = "0.11"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+postcard = { version = "1.0", features = ["alloc"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "net", "sync", "time"] }
+anyhow = "1.0"
+log = "0.4"
+ab_glyph = "0.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+ndk = { version = "0.9", features = ["audio", "media", "nativewindow", "api-level-29"] }
+ndk-sys = "0.6"
+jni = "0.21"
+android_logger = "0.14"
+
+[package.metadata.android]
+package = "com.vdesk.quest"
+build_targets = ["aarch64-linux-android"]
+apk_name = "vdesk-quest"
+runtime_libs = "libs"
+
+[package.metadata.android.sdk]
+min_sdk_version = 29
+target_sdk_version = 32
+
+[[package.metadata.android.uses_feature]]
+name = "android.hardware.vr.headtracking"
+required = true
+version = 1
+
+[[package.metadata.android.uses_feature]]
+name = "com.oculus.feature.PASSTHROUGH"
+required = false
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.USE_SCENE"
+
+[[package.metadata.android.uses_permission]]
+name = "com.oculus.permission.HAND_TRACKING"
+
+[[package.metadata.android.uses_permission]]
+name = "org.khronos.openxr.permission.OPENXR"
+
+[[package.metadata.android.uses_permission]]
+name = "org.khronos.openxr.permission.OPENXR_SYSTEM"
+
+[[package.metadata.android.queries.intent]]
+actions = ["org.khronos.openxr.OpenXRRuntimeService"]
+
+[[package.metadata.android.queries.intent]]
+actions = ["org.khronos.openxr.OpenXRApiLayerService"]
+
+[package.metadata.android.application]
+label = "vdesk-rs"
+
+[package.metadata.android.application.activity]
+config_changes = "density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode"
+launch_mode = "singleTask"
+orientation = "landscape"
+resizeable_activity = false
+theme = "@android:style/Theme.Black.NoTitleBar.Fullscreen"
+
+[[package.metadata.android.application.activity.intent_filter]]
+actions = ["android.intent.action.MAIN"]
+categories = [
+    "android.intent.category.LAUNCHER",
+    "com.oculus.intent.category.VR",
+    "org.khronos.openxr.intent.category.IMMERSIVE_HMD",
+]

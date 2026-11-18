@@ -1,0 +1,9 @@
+[package]
+name = "vdesk-protocol"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.0", features = ["alloc"] }
+bitflags = { version = "2.6", features = ["serde"] }
