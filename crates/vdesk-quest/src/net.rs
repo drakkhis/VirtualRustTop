@@ -86,8 +86,7 @@ pub struct DecodedStreamPacket {
 
 pub struct QuicClient {
     conn: Connection,
-    ctrl_send: Arc<tokio::sync::Mutex<SendStream>>,
-    rt_handle: tokio::runtime::Handle,
+    ctrl_tx: mpsc::UnboundedSender<ControlMessage>,
     pub monitors: Vec<MonitorDescriptor>,
 }
 
@@ -96,7 +95,6 @@ impl QuicClient {
         server_addr: SocketAddr,
         frame_tx: mpsc::Sender<DecodedStreamPacket>,
     ) -> Result<Self> {
-        let rt_handle = tokio::runtime::Handle::current();
         let _ = rustls::crypto::ring::default_provider().install_default();
         let mut tls_config = rustls::ClientConfig::builder()
             .dangerous()
@@ -191,27 +189,41 @@ impl QuicClient {
             }
         });
 
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ControlMessage>();
+        tokio::spawn(async move {
+            while let Some(msg) = ctrl_rx.recv().await {
+                let Ok(bytes) = postcard::to_allocvec(&msg) else {
+                    continue;
+                };
+                if write_length_prefixed(&mut ctrl_send, &bytes).await.is_err() {
+                    break;
+                }
+            }
+        });
+
         Ok(Self {
             conn,
-            ctrl_send: Arc::new(tokio::sync::Mutex::new(ctrl_send)),
-            rt_handle,
+            ctrl_tx,
             monitors,
         })
     }
 
     pub fn request_idr(&self, stream_id: u32) {
-        let ctrl_send = self.ctrl_send.clone();
-        self.rt_handle.spawn(async move {
-            if let Ok(bytes) = postcard::to_allocvec(&ControlMessage::RequestIdr { stream_id }) {
-                let mut send = ctrl_send.lock().await;
-                let _ = write_length_prefixed(&mut send, &bytes).await;
-            }
-        });
+        let _ = self.ctrl_tx.send(ControlMessage::RequestIdr { stream_id });
     }
 
     pub fn send_input(&self, event: &InputEvent) -> Result<()> {
-        let bytes = postcard::to_allocvec(event)?;
-        self.conn.send_datagram(bytes.into())?;
+        match event {
+            InputEvent::KeyboardKey { .. } | InputEvent::PointerButton { .. } => {
+                let _ = self
+                    .ctrl_tx
+                    .send(ControlMessage::ReliableInput(event.clone()));
+            }
+            InputEvent::PointerMotionAbsolute { .. } | InputEvent::PointerAxisScroll { .. } => {
+                let bytes = postcard::to_allocvec(event)?;
+                self.conn.send_datagram(bytes.into())?;
+            }
+        }
         Ok(())
     }
 }

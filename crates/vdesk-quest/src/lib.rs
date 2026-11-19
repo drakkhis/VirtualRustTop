@@ -2,6 +2,7 @@ pub mod audio;
 pub mod decoder;
 pub mod keyboard;
 pub mod net;
+pub mod pointer;
 pub mod raycast;
 pub mod xr_session;
 
@@ -122,6 +123,28 @@ fn is_repeatable_keycode(code: u32) -> bool {
 }
 
 #[cfg(target_os = "android")]
+fn release_one_shot_modifiers(
+    active_client: &net::QuicClient,
+    keyboard: &mut keyboard::VirtualKeyboard,
+) {
+    for (flag, mod_code) in [
+        (&mut keyboard.shift, 42u32),
+        (&mut keyboard.ctrl, 29u32),
+        (&mut keyboard.alt, 56u32),
+        (&mut keyboard.super_key, 125u32),
+    ] {
+        if *flag {
+            *flag = false;
+            keyboard.dirty = true;
+            let _ = active_client.send_input(&vdesk_protocol::InputEvent::KeyboardKey {
+                evdev_keycode: mod_code,
+                pressed: false,
+            });
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
 fn release_kb_key(
     active_client: &net::QuicClient,
     keyboard: &mut keyboard::VirtualKeyboard,
@@ -136,21 +159,7 @@ fn release_kb_key(
             evdev_keycode: hk.keycode,
             pressed: false,
         });
-        for (flag, mod_code) in [
-            (&mut keyboard.shift, 42u32),
-            (&mut keyboard.ctrl, 29u32),
-            (&mut keyboard.alt, 56u32),
-            (&mut keyboard.super_key, 125u32),
-        ] {
-            if *flag {
-                *flag = false;
-                keyboard.dirty = true;
-                let _ = active_client.send_input(&vdesk_protocol::InputEvent::KeyboardKey {
-                    evdev_keycode: mod_code,
-                    pressed: false,
-                });
-            }
-        }
+        release_one_shot_modifiers(active_client, keyboard);
     }
 }
 
@@ -175,12 +184,21 @@ fn press_kb_key(
                 evdev_keycode: code,
                 pressed: true,
             });
-            let now = std::time::Instant::now();
-            *held = Some(HeldKbKey {
-                keycode: code,
-                pressed_at: now,
-                last_repeat: now,
-            });
+            if is_repeatable_keycode(code) {
+                let now = std::time::Instant::now();
+                *held = Some(HeldKbKey {
+                    keycode: code,
+                    pressed_at: now,
+                    last_repeat: now,
+                });
+            } else {
+                let _ = active_client.send_input(&vdesk_protocol::InputEvent::KeyboardKey {
+                    evdev_keycode: code,
+                    pressed: false,
+                });
+                release_one_shot_modifiers(active_client, keyboard);
+                *held = None;
+            }
         }
         keyboard::KeyAction::Modifier(code) => {
             let active = match code {
@@ -319,6 +337,10 @@ fn android_main(app: android_activity::AndroidApp) {
         let mut kb_held: [Option<HeldKbKey>; 2] = [None, None];
         let mut event_storage = xr::EventDataBuffer::new();
         let mut session_running = false;
+        let mut pointer_stabilizer = pointer::PointerStabilizer::new();
+        let mut right_trig_engaged = false;
+        let mut left_trig_engaged = false;
+        let mut kb_trig = [keyboard::KbTriggerState::new(); 2];
         let mut trigger_down = [false; 2];
         let mut right_click_down = false;
         let mut left_rclick_held = false;
@@ -644,8 +666,10 @@ fn android_main(app: android_activity::AndroidApp) {
                 }
 
                 if grabbed.is_some() {
+                    pointer_stabilizer.reset();
                     for h in 0..2 {
                         release_kb_key(active_client, &mut keyboard, h, &mut kb_held[h]);
+                        kb_trig[h].reset();
                         if keyboard.cursors[h].take().is_some() {
                             keyboard.dirty = true;
                         }
@@ -675,17 +699,32 @@ fn android_main(app: android_activity::AndroidApp) {
                     .state(&xr_sess.session, xr::Path::NULL)
                     .map(|s| s.current_state)
                     .unwrap_or(false);
-                let right_trig = xr_sess
+                let stick_click = xr_sess
+                    .right_thumbstick_click_action
+                    .state(&xr_sess.session, xr::Path::NULL)
+                    .map(|s| s.current_state)
+                    .unwrap_or(false);
+                let right_trig_val = xr_sess
                     .trigger_action
                     .state(&xr_sess.session, xr::Path::NULL)
-                    .map(|s| s.current_state > 0.5)
-                    .unwrap_or(false);
-                let left_trig = xr_sess
+                    .map(|s| s.current_state)
+                    .unwrap_or(0.0);
+                let left_trig_val = xr_sess
                     .left_trigger_action
                     .state(&xr_sess.session, xr::Path::NULL)
-                    .map(|s| s.current_state > 0.5)
-                    .unwrap_or(false);
-                let trig_pressed = [right_trig || a_down, left_trig];
+                    .map(|s| s.current_state)
+                    .unwrap_or(0.0);
+                right_trig_engaged = if right_trig_engaged {
+                    right_trig_val > 0.35
+                } else {
+                    right_trig_val > 0.55
+                };
+                left_trig_engaged = if left_trig_engaged {
+                    left_trig_val > 0.35
+                } else {
+                    left_trig_val > 0.55
+                };
+                let trig_pressed = [right_trig_engaged || a_down, left_trig_engaged];
 
                 // Pointer & Dual-Hand Virtual Keyboard interaction (when not grabbing)
                 if grabbed.is_none() {
@@ -718,7 +757,7 @@ fn android_main(app: android_activity::AndroidApp) {
                         let cursor_changed = match (keyboard.cursors[h], new_cursor) {
                             (None, None) => None,
                             (Some((ou, ov)), Some((nu, nv))) => {
-                                if (nu - ou).abs() >= 0.004 || (nv - ov).abs() >= 0.004 {
+                                if (nu - ou).abs() >= 0.0025 || (nv - ov).abs() >= 0.0025 {
                                     Some(false)
                                 } else {
                                     None
@@ -747,7 +786,15 @@ fn android_main(app: android_activity::AndroidApp) {
                         }
 
                         if kb_closer[h] {
-                            if trig_pressed[h]
+                            if h == 0 {
+                                pointer_stabilizer.reset();
+                            }
+                            let kb_pressed = if h == 0 {
+                                kb_trig[0].update(right_trig_val) || a_down
+                            } else {
+                                kb_trig[1].update(left_trig_val)
+                            };
+                            if kb_pressed
                                 && !trigger_down[h]
                                 && !(h == 1 && left_rclick_held)
                             {
@@ -764,10 +811,10 @@ fn android_main(app: android_activity::AndroidApp) {
                                         &mut kb_held[h],
                                     );
                                 }
-                            } else if !trig_pressed[h] && trigger_down[h] {
+                            } else if !kb_pressed && trigger_down[h] {
                                 trigger_down[h] = false;
                                 release_kb_key(active_client, &mut keyboard, h, &mut kb_held[h]);
-                            } else if trig_pressed[h] && trigger_down[h] {
+                            } else if kb_pressed && trigger_down[h] {
                                 if let Some(ref mut hk) = kb_held[h] {
                                     if is_repeatable_keycode(hk.keycode)
                                         && hk.pressed_at.elapsed()
@@ -793,14 +840,38 @@ fn android_main(app: android_activity::AndroidApp) {
                                 }
                             }
                         } else if h == 0 {
+                            kb_trig[0].reset();
+                            let desktop_btn_down = (trig_pressed[0] && kb_held[0].is_none())
+                                || b_down
+                                || stick_click
+                                || (!kb_closer[1]
+                                    && trig_pressed[1]
+                                    && kb_held[1].is_none()
+                                    && !trigger_down[1]);
                             if let Some((_, stream_id, uv)) = monitor_hit {
-                                let _ = active_client.send_input(
-                                    &vdesk_protocol::InputEvent::PointerMotionAbsolute {
-                                        stream_id,
-                                        u: uv.x.clamp(0.0, 1.0),
-                                        v: uv.y.clamp(0.0, 1.0),
-                                    },
-                                );
+                                let (mon_w, mon_h) = monitor_swapchains
+                                    .iter()
+                                    .find(|m| m.screen.stream_id == stream_id)
+                                    .map(|m| (m.width as f32, m.height as f32))
+                                    .unwrap_or((1920.0, 1080.0));
+                                if let Some(stab_uv) = pointer_stabilizer.update(
+                                    stream_id,
+                                    uv,
+                                    mon_w,
+                                    mon_h,
+                                    right_trig_val,
+                                    desktop_btn_down,
+                                    dt,
+                                    now,
+                                ) {
+                                    let _ = active_client.send_input(
+                                        &vdesk_protocol::InputEvent::PointerMotionAbsolute {
+                                            stream_id,
+                                            u: stab_uv.x,
+                                            v: stab_uv.y,
+                                        },
+                                    );
+                                }
                             }
                             if trig_pressed[0] != trigger_down[0] {
                                 trigger_down[0] = trig_pressed[0];
@@ -830,9 +901,12 @@ fn android_main(app: android_activity::AndroidApp) {
                                     },
                                 );
                             }
-                        } else if !trig_pressed[1] && trigger_down[1] {
-                            trigger_down[1] = false;
-                            release_kb_key(active_client, &mut keyboard, 1, &mut kb_held[1]);
+                        } else {
+                            kb_trig[1].reset();
+                            if !trig_pressed[1] && trigger_down[1] {
+                                trigger_down[1] = false;
+                                release_kb_key(active_client, &mut keyboard, 1, &mut kb_held[1]);
+                            }
                         }
                     }
 
@@ -841,11 +915,6 @@ fn android_main(app: android_activity::AndroidApp) {
                         && trig_pressed[1]
                         && kb_held[1].is_none()
                         && !trigger_down[1];
-                    let stick_click = xr_sess
-                        .right_thumbstick_click_action
-                        .state(&xr_sess.session, xr::Path::NULL)
-                        .map(|s| s.current_state)
-                        .unwrap_or(false);
                     let rclick = b_down || left_rclick_held || stick_click;
                     if rclick != right_click_down {
                         right_click_down = rclick;
@@ -861,7 +930,7 @@ fn android_main(app: android_activity::AndroidApp) {
 
             if keyboard.dirty
                 || (kb_cursor_dirty
-                    && last_kb_upload.elapsed() >= std::time::Duration::from_millis(33))
+                    && last_kb_upload.elapsed() >= std::time::Duration::from_millis(16))
             {
                 let rgba = keyboard.render_rgba();
                 xr_sess.upload_keyboard_rgba(rgba)?;

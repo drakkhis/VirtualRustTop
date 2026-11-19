@@ -263,9 +263,31 @@ impl VirtualKeyboard {
     }
 
     pub fn hit_test(&self, u: f32, v: f32) -> Option<usize> {
-        self.active_rects()
+        if let Some(exact) = self
+            .active_rects()
             .iter()
             .position(|r| u >= r.x0 && u <= r.x1 && v >= r.y0 && v <= r.y1)
+        {
+            return Some(exact);
+        }
+        if !self.visible {
+            return None;
+        }
+        self.rects
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, r)| {
+                let dx = (r.x0 - u).max(0.0).max(u - r.x1);
+                let dy = (r.y0 - v).max(0.0).max(v - r.y1);
+                if dx <= 0.012 && dy <= 0.024 {
+                    let dist_px = (dx * KB_TEX_WIDTH as f32).hypot(dy * KB_TEX_HEIGHT as f32);
+                    Some((idx, dist_px))
+                } else {
+                    None
+                }
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(idx, _)| idx)
     }
 
     pub fn is_modifier_active(&self, action: KeyAction) -> bool {
@@ -660,6 +682,46 @@ fn draw_key(
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct KbTriggerState {
+    engaged: bool,
+    peak: f32,
+    trough: f32,
+}
+
+impl KbTriggerState {
+    pub fn new() -> Self {
+        Self {
+            engaged: false,
+            peak: 0.0,
+            trough: 0.0,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.engaged = false;
+        self.peak = 0.0;
+        self.trough = 0.0;
+    }
+
+    pub fn update(&mut self, val: f32) -> bool {
+        if !self.engaged {
+            self.trough = self.trough.min(val);
+            if val > 0.32 && (val - self.trough) > 0.14 {
+                self.engaged = true;
+                self.peak = val;
+            }
+        } else {
+            self.peak = self.peak.max(val);
+            if val < 0.18 || (self.peak - val) > 0.22 {
+                self.engaged = false;
+                self.trough = val;
+            }
+        }
+        self.engaged
+    }
+}
+
 /// Map Android `AKEYCODE_*` hardware/Bluetooth keyboard codes to Linux `evdev` `KEY_*` codes.
 pub fn android_keycode_to_evdev(keycode: i32) -> Option<u32> {
     Some(match keycode {
@@ -938,5 +1000,49 @@ mod tests {
         assert_eq!(kb.render_rgba().len(), expected_len);
 
         assert_eq!(android_keycode_to_evdev(66), Some(28));
+    }
+
+    #[test]
+    fn hit_test_snaps_across_inter_key_gaps() {
+        let mut kb = VirtualKeyboard::new();
+        // Outside collapsed toolbar dock still returns None for click-through
+        assert!(kb.hit_test(0.05, 0.20).is_none());
+
+        kb.visible = true;
+        // Pick two horizontally adjacent keys in row 0 and probe their exact midpoint gap
+        let r0 = &kb.rects[1];
+        let r1 = &kb.rects[2];
+        assert!((r0.y0 - r1.y0).abs() < 1e-4);
+        let gap_u = (r0.x1 + r1.x0) * 0.5;
+        let mid_v = (r0.y0 + r0.y1) * 0.5;
+        assert!(!(r0.x0..=r0.x1).contains(&gap_u));
+        assert!(!(r1.x0..=r1.x1).contains(&gap_u));
+        assert!(kb.hit_test(gap_u, mid_v).is_some());
+
+        // Pick two vertically adjacent rows and probe their exact vertical gap
+        let r_row1 = kb
+            .rects
+            .iter()
+            .find(|r| r.y0 > r0.y1 && gap_u >= r.x0 && gap_u <= r.x1)
+            .expect("row 1 key below gap");
+        let gap_v = (r0.y1 + r_row1.y0) * 0.5;
+        assert!(kb.hit_test((r_row1.x0 + r_row1.x1) * 0.5, gap_v).is_some());
+    }
+
+    #[test]
+    fn kb_trigger_hair_trigger_and_rapid_double_tap() {
+        let mut trig = KbTriggerState::new();
+        assert!(!trig.update(0.10));
+        // Hair-trigger engages above 0.32
+        assert!(trig.update(0.35));
+        // Stays engaged up to 0.85 and through minor 0.07 jitter (0.85 -> 0.78)
+        assert!(trig.update(0.85));
+        assert!(trig.update(0.78));
+        // Rebounds by > 0.22 (0.85 -> 0.40) -> releases immediately even above 0.18
+        assert!(!trig.update(0.40));
+        // Continues descending -> stays released without spurious re-trigger
+        assert!(!trig.update(0.36));
+        // Rapid second squeeze (0.36 -> 0.55) -> re-engages immediately
+        assert!(trig.update(0.55));
     }
 }

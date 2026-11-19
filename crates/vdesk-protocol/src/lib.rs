@@ -63,6 +63,8 @@ pub enum ControlMessage {
         stream_id: u32,
         bitrate_kbps: u32,
     },
+    /// Reliable, FIFO-ordered input event (keystrokes and mouse button edges)
+    ReliableInput(InputEvent),
 }
 
 /// High-frequency Video Frame Header prepended to QUIC stream or fragmented datagrams

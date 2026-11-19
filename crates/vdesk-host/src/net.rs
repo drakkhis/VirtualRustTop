@@ -250,12 +250,13 @@ async fn handle_connection(
 
     // 2. Spawn datagram input receiver
     let conn_in = conn.clone();
+    let input_tx_dgram = input_tx.clone();
     let input_task = tokio::spawn(async move {
         loop {
             match conn_in.read_datagram().await {
                 Ok(bytes) => match postcard::from_bytes::<InputEvent>(&bytes) {
                     Ok(ev) => {
-                        if input_tx.send(ev).await.is_err() {
+                        if input_tx_dgram.send(ev).await.is_err() {
                             break;
                         }
                     }
@@ -269,8 +270,9 @@ async fn handle_connection(
         }
     });
 
-    // 3. Spawn control message receiver
+    // 3. Spawn control & reliable-input receiver
     let idr_flags_ctrl = idr_flags.clone();
+    let input_tx_ctrl = input_tx;
     let ctrl_task = tokio::spawn(async move {
         while let Ok(buf) = read_length_prefixed(&mut ctrl_recv).await {
             match postcard::from_bytes::<ControlMessage>(&buf) {
@@ -278,6 +280,11 @@ async fn handle_connection(
                     if let Some(flag) = idr_flags_ctrl.get(&stream_id) {
                         flag.store(true, Ordering::Release);
                         info!("Quest requested IDR for stream_id={}", stream_id);
+                    }
+                }
+                Ok(ControlMessage::ReliableInput(ev)) => {
+                    if input_tx_ctrl.send(ev).await.is_err() {
+                        break;
                     }
                 }
                 Ok(msg) => debug!("Control message from Quest: {:?}", msg),
@@ -542,6 +549,33 @@ mod tests {
                 assert!((v - 0.75).abs() < 1e-6);
             }
             other => panic!("Unexpected input event: {:?}", other),
+        }
+
+        // 4. Send reliable KeyboardKey over control stream from client -> host
+        write_length_prefixed(
+            &mut ctrl_send,
+            &postcard::to_allocvec(&ControlMessage::ReliableInput(InputEvent::KeyboardKey {
+                evdev_keycode: 30,
+                pressed: true,
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let rel_received = tokio::time::timeout(std::time::Duration::from_secs(2), input_rx.recv())
+            .await
+            .expect("reliable input timeout")
+            .expect("reliable input event");
+        match rel_received {
+            InputEvent::KeyboardKey {
+                evdev_keycode,
+                pressed,
+            } => {
+                assert_eq!(evdev_keycode, 30);
+                assert!(pressed);
+            }
+            other => panic!("Unexpected reliable input event: {:?}", other),
         }
 
         server_task.abort();
