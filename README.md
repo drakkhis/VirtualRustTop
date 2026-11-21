@@ -2,7 +2,9 @@
 
 Native, lightweight Linux-to-Quest virtual desktop streamer written in Rust (Wayland DMA-BUF, NVENC AV1, QUIC, OpenXR).
 
-> **[Demo Clip Placeholder]** — *A ~20-second headset recording showing crisp text/code rendering alongside smooth Wi-Fi video playback, plus latency and VRAM notes, will be linked here for `v0.1.0`.*
+[![VirtualRustTop Demo — Click for full 1080p 60fps MP4](docs/assets/demo-preview.webp)](https://github.com/drakkhis/VirtualRustTop/releases/download/v0.1.0/VirtualRustTop-demo.mp4)
+
+*Recorded directly on Meta Quest 3 over Wi-Fi streaming dual Wayland monitors (`2560×1440` + `1080×1920` @ 60 fps, AV1 ABR up to 61 Mbps + 34 Mbps): **~3 ms QUIC RTT (`0.00%` packet loss)** and **~521 MiB host GPU VRAM**. Click preview for the full 1080p 60fps MP4.*
 
 ---
 
@@ -93,7 +95,17 @@ cargo build --release -p vdesk-host
 ```
 
 - On first launch, approve the XDG Desktop Portal screen-sharing & remote-desktop dialog (a persistent restore token is saved to `$XDG_CONFIG_HOME/vdesk-rs/portal_restore_token`).
-- Allow **UDP `9443`** (QUIC stream) and **UDP `9444`** (LAN auto-discovery) through your local firewall.
+- Allow **UDP `9443`** (QUIC stream) and **UDP `9444`** (LAN auto-discovery) through your local firewall:
+
+  ```bash
+  # UFW (Ubuntu / Debian / Arch) — allow both QUIC (9443) and LAN discovery (9444)
+  sudo ufw allow 9443:9444/udp
+  # Or restrict to your LAN subnet:
+  # sudo ufw allow from 192.168.1.0/24 to any port 9443:9444 proto udp
+
+  # firewalld (Fedora / RHEL)
+  sudo firewall-cmd --add-port=9443-9444/udp --permanent && sudo firewall-cmd --reload
+  ```
 
 #### Host CLI Flags & Environment Variables
 
