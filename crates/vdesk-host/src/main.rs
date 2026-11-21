@@ -6,14 +6,72 @@ mod nvenc;
 mod portal;
 mod tray;
 
+use clap::Parser;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::AtomicBool;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use vdesk_protocol::{InputEvent, MonitorDescriptor, VideoCodec};
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "vdesk-host",
+    version,
+    about = "VirtualRustTop Linux Wayland -> Quest 3 virtual desktop host"
+)]
+struct Cli {
+    /// QUIC UDP listen port
+    #[arg(long, env = "VDESK_PORT", default_value_t = vdesk_protocol::DEFAULT_PORT)]
+    port: u16,
+
+    /// UDP LAN auto-discovery responder port (0 disables discovery)
+    #[arg(long, env = "VDESK_DISCOVER_PORT", default_value_t = vdesk_protocol::DISCOVER_PORT)]
+    discover_port: u16,
+
+    /// Maximum capture/encode frame rate (30-120 FPS)
+    #[arg(long, env = "VDESK_MAX_FPS", default_value_t = 60, value_parser = clap::value_parser!(u32).range(30..=120))]
+    max_fps: u32,
+
+    /// Fixed target bitrate override in kbps (auto-scaled per monitor when unset)
+    #[arg(long, env = "VDESK_BITRATE_KBPS")]
+    bitrate_kbps: Option<u32>,
+
+    /// Disable PipeWire virtual audio sink routing to the Quest client
+    #[arg(long, env = "VDESK_NO_AUDIO")]
+    no_audio: bool,
+
+    /// Run the KDE / Freedesktop system tray controller instead of the streamer
+    #[arg(long)]
+    tray: bool,
+
+    /// Systemd user unit controlled by --tray
+    #[arg(long, env = "VDESK_SERVICE_NAME", default_value = "vdesk-host.service")]
+    service: String,
+
+    /// Verify /dev/uinput virtual device registration and exit
+    #[arg(long)]
+    test_uinput: bool,
+
+    /// Verify XDG Desktop Portal initialization and exit
+    #[arg(long)]
+    test_portal: bool,
+
+    /// Dump N encoded AV1 frames from the primary monitor and exit
+    #[arg(long, value_name = "COUNT")]
+    dump_frames: Option<usize>,
+
+    /// Output file path used with --dump-frames
+    #[arg(long, default_value = "vdesk_dump.av1")]
+    dump_output: PathBuf,
+
+    /// Inject N synthetic pointer motion events via /dev/uinput and exit
+    #[arg(long, value_name = "COUNT")]
+    wiggle_uinput: Option<usize>,
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -23,26 +81,16 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args: Vec<String> = std::env::args().collect();
-    if args.iter().any(|a| a == "--tray") {
-        return tray::run_tray().await;
+    let cli = Cli::parse();
+    if cli.tray {
+        return tray::run_tray(cli.service).await;
     }
-    let test_input_only = args.iter().any(|a| a == "--test-uinput");
-    let test_portal = args.iter().any(|a| a == "--test-portal");
-    let dump_frames: Option<usize> = args
-        .windows(2)
-        .find(|w| w[0] == "--dump-frames")
-        .and_then(|w| w[1].parse().ok());
-    let wiggle_uinput: Option<usize> = args
-        .windows(2)
-        .find(|w| w[0] == "--wiggle-uinput")
-        .and_then(|w| w[1].parse().ok());
 
     info!("vdesk-host starting up");
 
-    if let Some(count) = wiggle_uinput {
+    if let Some(count) = cli.wiggle_uinput {
         info!("Running --wiggle-uinput for {} iterations...", count);
-        let mut injector = input::KernelInputInjector::new(2560, 1440)?;
+        let mut injector = input::KernelInputInjector::new(1920, 1080)?;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         for i in 0..count {
             let u = 0.45 + ((i % 20) as f32) * 0.005;
@@ -54,8 +102,8 @@ async fn main() -> anyhow::Result<()> {
                 },
                 0,
                 0,
-                2560,
-                1440,
+                1920,
+                1080,
             )?;
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
         }
@@ -63,9 +111,9 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    if test_input_only {
+    if cli.test_uinput {
         info!("Running /dev/uinput registration test...");
-        let mut injector = input::KernelInputInjector::new(2560, 1440)?;
+        let mut injector = input::KernelInputInjector::new(1920, 1080)?;
         info!("Registered virtual input device: vdesk-rs Quest 3 Spatial Input");
         injector.inject(
             InputEvent::PointerMotionAbsolute {
@@ -75,14 +123,25 @@ async fn main() -> anyhow::Result<()> {
             },
             0,
             0,
-            2560,
-            1440,
+            1920,
+            1080,
         )?;
         info!("Injected center pointer motion event via /dev/uinput");
         return Ok(());
     }
 
     let portal_session = portal::init_wayland_session().await?;
+
+    let max_fps = cli.max_fps;
+    let bitrate_override = cli.bitrate_kbps;
+    info!(
+        "Streaming config: port={}, discover_port={}, max_fps={}, bitrate_override={:?}, audio_enabled={}",
+        cli.port,
+        cli.discover_port,
+        max_fps,
+        bitrate_override,
+        !cli.no_audio
+    );
 
     let mut max_w = 1920i32;
     let mut max_h = 1080i32;
@@ -102,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
             name: format!("Monitor-{}", idx + 1),
             width: w as u32,
             height: h as u32,
-            refresh_rate_mhz: 90_000,
+            refresh_rate_mhz: max_fps * 1000,
             logical_x: x,
             logical_y: y,
             codec: VideoCodec::Av1YUV420,
@@ -115,7 +174,7 @@ async fn main() -> anyhow::Result<()> {
         max_w, max_h
     );
 
-    if test_portal {
+    if cli.test_portal {
         if let Some(mon) = monitors.first() {
             info!(
                 "Testing portal notify_pointer_motion_absolute on stream {} ({}x{})",
@@ -146,37 +205,45 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (cap_tx, mut cap_rx) = mpsc::channel::<capture::EncodedFrame>(128);
-
-    if let Some(target_frames) = dump_frames {
+    if let Some(target_frames) = cli.dump_frames {
         // Pick the largest monitor (typically the primary landscape display) for single-file dump
-        let first_node_id = monitors
+        let primary = monitors
             .iter()
             .max_by_key(|m| m.width * m.height)
-            .map(|m| m.stream_id)
             .ok_or_else(|| anyhow::anyhow!("No PipeWire streams returned by portal"))?;
+
+        let (def_kbps, min_kbps, max_kbps) =
+            capture::default_bitrate_bounds(primary.width, primary.height, bitrate_override);
+        let control = Arc::new(capture::StreamControl::new(def_kbps, min_kbps, max_kbps));
+        let active_clients = Arc::new(AtomicUsize::new(1));
+        let (dump_tx, mut dump_rx) = broadcast::channel::<Arc<capture::EncodedFrame>>(24);
 
         let _capture_handle = capture::spawn_capture_thread(
             Some(portal_session.pipewire_fd),
-            first_node_id,
+            primary.stream_id,
             VideoCodec::Av1YUV420,
-            25_000,
-            Arc::new(AtomicBool::new(false)),
-            cap_tx,
+            max_fps,
+            bitrate_override,
+            control,
+            active_clients,
+            dump_tx,
         );
 
-        let out_path = "vdesk_dump.av1";
-        let mut file = std::fs::File::create(out_path)?;
+        let mut file = std::fs::File::create(&cli.dump_output)?;
         let mut count = 0usize;
-        info!("Dumping {} encoded frames to {}...", target_frames, out_path);
-        while let Some(frame) = cap_rx.recv().await {
+        info!(
+            "Dumping {} encoded frames to {}...",
+            target_frames,
+            cli.dump_output.display()
+        );
+        while let Ok(frame) = dump_rx.recv().await {
             file.write_all(&frame.payload)?;
             count += 1;
             if count >= target_frames {
                 break;
             }
         }
-        info!("Dumped {} frames to {}", count, out_path);
+        info!("Dumped {} frames to {}", count, cli.dump_output.display());
         return Ok(());
     }
 
@@ -185,25 +252,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let mut capture_handles = Vec::with_capacity(monitors.len());
-    let mut idr_flags: HashMap<u32, Arc<AtomicBool>> = HashMap::new();
+    let mut stream_controls: HashMap<u32, Arc<capture::StreamControl>> = HashMap::new();
+    let mut monitor_channels: HashMap<u32, broadcast::Sender<Arc<capture::EncodedFrame>>> =
+        HashMap::new();
+    let active_clients = Arc::new(AtomicUsize::new(0));
     let mut pw_fd = Some(portal_session.pipewire_fd);
     for mon in &monitors {
-        let force_idr = Arc::new(AtomicBool::new(false));
-        idr_flags.insert(mon.stream_id, force_idr.clone());
+        let (def_kbps, min_kbps, max_kbps) =
+            capture::default_bitrate_bounds(mon.width, mon.height, bitrate_override);
+        let control = Arc::new(capture::StreamControl::new(def_kbps, min_kbps, max_kbps));
+        let (frame_tx, _) = broadcast::channel::<Arc<capture::EncodedFrame>>(24);
+        stream_controls.insert(mon.stream_id, control.clone());
+        monitor_channels.insert(mon.stream_id, frame_tx.clone());
         info!(
-            "Spawning PipeWire capture thread for {} (node_id={}, {}x{})",
-            mon.name, mon.stream_id, mon.width, mon.height
+            "Spawning PipeWire capture thread for {} (node_id={}, {}x{}, max_fps={})",
+            mon.name, mon.stream_id, mon.width, mon.height, max_fps
         );
         capture_handles.push(capture::spawn_capture_thread(
             pw_fd.take(),
             mon.stream_id,
             mon.codec,
-            25_000,
-            force_idr,
-            cap_tx.clone(),
+            max_fps,
+            bitrate_override,
+            control,
+            active_clients.clone(),
+            frame_tx,
         ));
     }
-    let idr_flags = Arc::new(idr_flags);
+    let stream_controls = Arc::new(stream_controls);
 
     // Nudge pointer on each monitor so KWin emits initial PipeWire frames on a static desktop.
     for mon in &monitors {
@@ -229,30 +305,32 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    let (bcast_tx, _) = broadcast::channel::<Arc<capture::EncodedFrame>>(128);
-    let bcast_tx_clone = bcast_tx.clone();
-    let bcast_task = tokio::spawn(async move {
-        while let Some(frame) = cap_rx.recv().await {
-            let _ = bcast_tx_clone.send(Arc::new(frame));
-        }
-    });
-
-    let audio_router = audio::AudioRouter::new();
+    let audio_router = if cli.no_audio {
+        audio::AudioRouter::new_disabled()
+    } else {
+        audio::AudioRouter::new()
+    };
     let audio_router_net = audio_router.clone();
 
     let (input_tx, mut input_rx) = mpsc::channel::<InputEvent>(256);
-    let quic_server = net::QuicServer::default_bind()?;
+    let quic_server = net::QuicServer::bind_with_discover(cli.port, cli.discover_port)?;
     let quic_task = tokio::spawn(async move {
         if let Err(e) = quic_server
-            .run(monitors, bcast_tx, idr_flags, audio_router_net, input_tx)
+            .run(
+                monitors,
+                monitor_channels,
+                stream_controls,
+                active_clients,
+                audio_router_net,
+                input_tx,
+            )
             .await
         {
             warn!("QUIC server exited: {:#}", e);
         }
     });
 
-    let mut sigterm =
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
     // Hybrid input dispatch loop
     loop {
@@ -288,7 +366,6 @@ async fn main() -> anyhow::Result<()> {
 
     audio_router.force_restore();
     quic_task.abort();
-    bcast_task.abort();
     for handle in &mut capture_handles {
         handle.stop_and_join();
     }

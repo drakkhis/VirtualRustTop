@@ -1,0 +1,62 @@
+name: Bug Report
+description: Report a bug on the tested Linux Wayland + NVIDIA NVENC + Meta Quest 3 stack
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **Scope & Support Notice:**
+        > `VirtualRustTop` is a personal project tested strictly on **Linux Wayland (KDE Plasma / KWin) + NVIDIA RTX 40-series+ (NVENC AV1) + Meta Quest 3**, released as-is with **no support guarantees**.
+        >
+        > Support for AMD (VA-API), Intel (QuickSync), X11, or other headsets/compositors is **community-supported via Pull Requests only** — please do not open issues requesting them.
+  - type: input
+    id: os
+    attributes:
+      label: Linux Distro & Kernel
+      placeholder: e.g. Arch Linux / Kernel 6.x
+    validations:
+      required: true
+  - type: input
+    id: compositor
+    attributes:
+      label: Wayland Compositor & Desktop Environment
+      placeholder: e.g. KDE Plasma 6.x (KWin Wayland)
+    validations:
+      required: true
+  - type: input
+    id: gpu
+    attributes:
+      label: NVIDIA GPU & Driver Version (`nvidia-smi`)
+      placeholder: e.g. RTX 4080 / Driver 570.x
+    validations:
+      required: true
+  - type: input
+    id: quest
+    attributes:
+      label: Quest Model & Horizon OS Firmware
+      placeholder: e.g. Meta Quest 3 / v72
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: VirtualRustTop Version / Commit
+      placeholder: e.g. v0.1.0 or git commit hash
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Description & Steps to Reproduce
+      description: Describe what happened and how to reproduce it.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Host & Quest Logs
+      description: Attach relevant `RUST_LOG=debug vdesk-host` and/or `adb logcat -s vdesk-quest:*` output.
+      render: shell
+    validations:
+      required: true

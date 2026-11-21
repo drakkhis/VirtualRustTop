@@ -1,6 +1,33 @@
-/target/
+# Rust / Cargo
+target/
+
+# Debug & capture artifacts
 *.av1
 *.log
+
+# Android APKs, signing keys & build artifacts
 *.apk
+*.aab
 *.idsig
+*.jks
+*.keystore
+*.p12
+*.pem
+*.key
+dist/
+.gradle/
+local.properties
+
+# Local config & environment overrides
+.env
+.env.local
+vdesk.local.toml
+host.txt
+
+# OS & IDE files
 .DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

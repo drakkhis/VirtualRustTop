@@ -128,8 +128,30 @@ pub fn raycast_monitors(
         })
 }
 
-pub fn build_cylinder_layer_params(screen: &CylinderScreen) -> CylinderLayerParams {
-    let (_, rot, pos) = screen.world_from_cylinder.to_scale_rotation_translation();
+pub fn rigid_transform(mat: Mat4) -> Mat4 {
+    let (_, rot, pos) = mat.to_scale_rotation_translation();
+    Mat4::from_rotation_translation(rot.normalize(), pos)
+}
+
+pub fn compute_head_lock_offset(head_world: Mat4, screen_world: Mat4) -> Mat4 {
+    rigid_transform(head_world.inverse() * screen_world)
+}
+
+pub fn resolve_head_locked_world(head_world: Mat4, head_from_cylinder: Mat4) -> Mat4 {
+    rigid_transform(head_world * head_from_cylinder)
+}
+
+pub fn centered_screen_transform_from_head(head_pos: Vec3, head_rot: Quat) -> Mat4 {
+    let fwd = head_rot * Vec3::NEG_Z;
+    let yaw = (-fwd.x).atan2(-fwd.z);
+    Mat4::from_translation(head_pos) * Mat4::from_rotation_y(yaw)
+}
+
+pub fn build_cylinder_layer_params_with_transform(
+    screen: &CylinderScreen,
+    space_from_cylinder: Mat4,
+) -> CylinderLayerParams {
+    let (_, rot, pos) = space_from_cylinder.to_scale_rotation_translation();
     let rot = rot.normalize();
     CylinderLayerParams {
         stream_id: screen.stream_id,
@@ -150,6 +172,10 @@ pub fn build_cylinder_layer_params(screen: &CylinderScreen) -> CylinderLayerPara
             },
         },
     }
+}
+
+pub fn build_cylinder_layer_params(screen: &CylinderScreen) -> CylinderLayerParams {
+    build_cylinder_layer_params_with_transform(screen, screen.world_from_cylinder)
 }
 
 pub fn build_cylinder_layer<'a, G: xr::Graphics>(
@@ -264,11 +290,17 @@ pub fn init_openxr_instance() -> Result<(xr::Entry, xr::Instance)> {
 
 pub struct MonitorSwapchain {
     pub screen: CylinderScreen,
+    pub name: String,
+    pub logical_x: i32,
     pub width: u32,
     pub height: u32,
+    // Declare `decoder` BEFORE `swapchain` so the decode thread stops and releases MediaCodec / ANativeWindow
+    // before OpenXR destroys the underlying swapchain.
+    pub decoder: crate::decoder::DecoderWorker,
     pub swapchain: xr::Swapchain<xr::Vulkan>,
-    pub decoder: crate::decoder::HardwareDecoder,
     pub pinned: bool,
+    pub hidden: bool,
+    pub head_lock: Option<Mat4>,
 }
 
 pub struct VulkanCleanup {
@@ -333,6 +365,7 @@ pub struct QuestXrSession {
     pub left_x_action: xr::Action<bool>,
     pub left_y_action: xr::Action<bool>,
     pub left_trigger_action: xr::Action<f32>,
+    pub left_thumbstick_click_action: xr::Action<bool>,
     // Must be last so OpenXR session and swapchains drop before VkDevice/VkInstance.
     _vk_cleanup: VulkanCleanup,
 }
@@ -369,8 +402,7 @@ impl QuestXrSession {
         let vk_instance_handle = vk::Instance::from_raw(raw_vk_instance as u64);
         let vk_instance = unsafe { ash::Instance::load(vk_entry.static_fn(), vk_instance_handle) };
 
-        let raw_phys_dev =
-            unsafe { instance.vulkan_graphics_device(system, raw_vk_instance)? };
+        let raw_phys_dev = unsafe { instance.vulkan_graphics_device(system, raw_vk_instance)? };
         let vk_phys_dev = vk::PhysicalDevice::from_raw(raw_phys_dev as u64);
 
         let queue_props =
@@ -464,8 +496,7 @@ impl QuestXrSession {
 
         let keyboard_swapchain = session.create_swapchain(&xr::SwapchainCreateInfo {
             create_flags: xr::SwapchainCreateFlags::EMPTY,
-            usage_flags: xr::SwapchainUsageFlags::SAMPLED
-                | xr::SwapchainUsageFlags::TRANSFER_DST,
+            usage_flags: xr::SwapchainUsageFlags::SAMPLED | xr::SwapchainUsageFlags::TRANSFER_DST,
             format: chosen_format,
             sample_count: 1,
             width: crate::keyboard::KB_TEX_WIDTH,
@@ -588,6 +619,11 @@ impl QuestXrSession {
             action_set.create_action::<bool>("left_y", "Recenter (Y)", &[left_hand])?;
         let left_trigger_action =
             action_set.create_action::<f32>("left_trigger", "Right Click (LT)", &[left_hand])?;
+        let left_thumbstick_click_action = action_set.create_action::<bool>(
+            "left_thumbstick_click",
+            "Screens Panel (LStick)",
+            &[left_hand],
+        )?;
 
         let oculus_profile =
             instance.string_to_path("/interaction_profiles/oculus/touch_controller")?;
@@ -646,11 +682,16 @@ impl QuestXrSession {
                     &left_trigger_action,
                     instance.string_to_path("/user/hand/left/input/trigger/value")?,
                 ),
+                xr::Binding::new(
+                    &left_thumbstick_click_action,
+                    instance.string_to_path("/user/hand/left/input/thumbstick/click")?,
+                ),
             ],
         );
         session.attach_action_sets(&[&action_set])?;
 
-        let aim_space = aim_action.create_space(session.clone(), right_hand, xr::Posef::IDENTITY)?;
+        let aim_space =
+            aim_action.create_space(session.clone(), right_hand, xr::Posef::IDENTITY)?;
         let left_aim_space =
             left_aim_action.create_space(session.clone(), left_hand, xr::Posef::IDENTITY)?;
 
@@ -692,6 +733,7 @@ impl QuestXrSession {
             left_x_action,
             left_y_action,
             left_trigger_action,
+            left_thumbstick_click_action,
             _vk_cleanup: VulkanCleanup {
                 vk_instance,
                 vk_device,
@@ -703,13 +745,21 @@ impl QuestXrSession {
         })
     }
 
+    /// Create an OpenXR Android Surface swapchain and bind a dedicated hardware decoder worker to it.
+    ///
+    /// # Safety
+    /// `env` must be a valid JNI environment pointer attached to the current thread.
     #[cfg(target_os = "android")]
     pub unsafe fn create_android_monitor_swapchain(
         &self,
         env: *mut jni::sys::JNIEnv,
         mon: &MonitorDescriptor,
         screen: CylinderScreen,
-    ) -> Result<MonitorSwapchain> {
+        on_request_idr: std::sync::Arc<dyn Fn(u32) + Send + Sync>,
+    ) -> Result<(
+        MonitorSwapchain,
+        std::sync::Arc<crate::decoder::MonitorFrameQueue>,
+    )> {
         use anyhow::Context;
         let ext = self
             .instance
@@ -745,34 +795,43 @@ impl QuestXrSession {
         }
 
         let swapchain = xr::Swapchain::from_raw(self.session.clone(), raw_swapchain);
-        let decoder = crate::decoder::HardwareDecoder::from_java_surface(
+        let (decoder, queue) = crate::decoder::DecoderWorker::spawn_from_java_surface(
             env,
             java_surface as jni::sys::jobject,
+            mon.stream_id,
             mon.codec,
             mon.width,
             mon.height,
+            on_request_idr,
         )?;
 
-        Ok(MonitorSwapchain {
-            screen,
-            width: mon.width,
-            height: mon.height,
-            swapchain,
-            decoder,
-            pinned: false,
-        })
+        Ok((
+            MonitorSwapchain {
+                screen,
+                name: mon.name.clone(),
+                logical_x: mon.logical_x,
+                width: mon.width,
+                height: mon.height,
+                decoder,
+                swapchain,
+                pinned: false,
+                hidden: false,
+                head_lock: None,
+            },
+            queue,
+        ))
     }
 
     pub fn build_passthrough_layer(&self) -> Option<xr::sys::CompositionLayerPassthroughFB> {
-        self.passthrough.as_ref().map(|(_, pt_layer)| {
-            xr::sys::CompositionLayerPassthroughFB {
+        self.passthrough
+            .as_ref()
+            .map(|(_, pt_layer)| xr::sys::CompositionLayerPassthroughFB {
                 ty: xr::sys::CompositionLayerPassthroughFB::TYPE,
                 next: ptr::null(),
                 flags: xr::CompositionLayerFlags::BLEND_TEXTURE_SOURCE_ALPHA,
                 space: xr::sys::Space::NULL,
                 layer_handle: *pt_layer.inner(),
-            }
-        })
+            })
     }
 
     fn locate_space_pose(
@@ -781,10 +840,9 @@ impl QuestXrSession {
         predicted_display_time: xr::Time,
     ) -> Result<Option<(Vec3, Quat)>> {
         let loc = space.locate(&self.local_space, predicted_display_time)?;
-        if !loc
-            .location_flags
-            .contains(xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID)
-        {
+        if !loc.location_flags.contains(
+            xr::SpaceLocationFlags::POSITION_VALID | xr::SpaceLocationFlags::ORIENTATION_VALID,
+        ) {
             return Ok(None);
         }
         let origin = Vec3::new(
@@ -802,7 +860,10 @@ impl QuestXrSession {
         Ok(Some((origin, q)))
     }
 
-    pub fn locate_aim_pose(&self, predicted_display_time: xr::Time) -> Result<Option<(Vec3, Quat)>> {
+    pub fn locate_aim_pose(
+        &self,
+        predicted_display_time: xr::Time,
+    ) -> Result<Option<(Vec3, Quat)>> {
         self.locate_space_pose(&self.aim_space, predicted_display_time)
     }
 
@@ -832,7 +893,10 @@ impl QuestXrSession {
             .map(|(origin, q)| (origin, (q * Vec3::NEG_Z).normalize())))
     }
 
-    pub fn locate_head_pose(&self, predicted_display_time: xr::Time) -> Result<Option<(Vec3, Quat)>> {
+    pub fn locate_head_pose(
+        &self,
+        predicted_display_time: xr::Time,
+    ) -> Result<Option<(Vec3, Quat)>> {
         self.locate_space_pose(&self.view_space, predicted_display_time)
     }
 
@@ -840,7 +904,11 @@ impl QuestXrSession {
         let expected =
             (crate::keyboard::KB_TEX_WIDTH * crate::keyboard::KB_TEX_HEIGHT * 4) as usize;
         if rgba.len() != expected {
-            anyhow::bail!("Keyboard RGBA size mismatch: {} != {}", rgba.len(), expected);
+            anyhow::bail!(
+                "Keyboard RGBA size mismatch: {} != {}",
+                rgba.len(),
+                expected
+            );
         }
 
         let img_idx = self.keyboard_swapchain.acquire_image()?;
@@ -947,7 +1015,8 @@ impl QuestXrSession {
 
     pub fn step_keepalive_swapchain(&mut self) -> Result<()> {
         let img_idx = self.keepalive_swapchain.acquire_image()?;
-        self.keepalive_swapchain.wait_image(xr::Duration::INFINITE)?;
+        self.keepalive_swapchain
+            .wait_image(xr::Duration::INFINITE)?;
         let image = *self
             .keepalive_images
             .get(img_idx as usize)
@@ -1081,5 +1150,76 @@ mod tests {
         assert!((params.central_angle - PRIMARY_MONITOR_ARC_RAD).abs() < 1e-5);
         assert!((params.aspect_ratio - (2560.0 / 1440.0)).abs() < 1e-5);
         assert!((params.pose.position.y - DEFAULT_EYE_HEIGHT_M).abs() < 1e-5);
+    }
+
+    #[test]
+    fn head_lock_roundtrip_tracks_full_6dof_head_motion_without_jump() {
+        let mut screen = build_default_cylinder_screen(101, 2560, 1440);
+        let initial_head = Mat4::from_rotation_translation(
+            Quat::from_euler(glam::EulerRot::YXZ, 0.4, -0.15, 0.05),
+            Vec3::new(1.2, 1.5, -0.8),
+        );
+        // Place screen slightly right, pitched down, and rolled relative to world
+        let placed_screen = Mat4::from_rotation_translation(
+            Quat::from_euler(glam::EulerRot::YXZ, 0.25, -0.22, 0.08),
+            Vec3::new(1.35, 1.42, -0.65),
+        );
+        screen.set_transform(placed_screen);
+
+        let head_from_cyl = compute_head_lock_offset(initial_head, screen.world_from_cylinder);
+        // Locking right where it was placed produces zero jump at the initial head pose.
+        let resolved_initial = resolve_head_locked_world(initial_head, head_from_cyl);
+        assert!((resolved_initial.w_axis - placed_screen.w_axis).length() < 1e-5);
+
+        // Move and rotate head arbitrarily in 6DOF (pitch + yaw + roll + walk to another room)
+        let moved_head = Mat4::from_rotation_translation(
+            Quat::from_euler(glam::EulerRot::YXZ, -1.8, 0.55, -0.18),
+            Vec3::new(5.4, 1.75, 3.2),
+        );
+        let resolved_moved = resolve_head_locked_world(moved_head, head_from_cyl);
+        screen.set_transform(resolved_moved);
+
+        // Head-relative offset must remain identical after arbitrary 6DOF head motion.
+        let re_measured_offset = compute_head_lock_offset(moved_head, screen.world_from_cylinder);
+        assert!((re_measured_offset.w_axis - head_from_cyl.w_axis).length() < 1e-5);
+        let (_, expected_rot, _) = head_from_cyl.to_scale_rotation_translation();
+        let (_, actual_rot, _) = re_measured_offset.to_scale_rotation_translation();
+        assert!(expected_rot.abs_diff_eq(actual_rot, 1e-5));
+
+        // VIEW-space cylinder layer params preserve geometry and head-relative pose.
+        let view_params = build_cylinder_layer_params_with_transform(&screen, head_from_cyl);
+        assert_eq!(view_params.stream_id, 101);
+        assert!((view_params.radius - DEFAULT_CYLINDER_RADIUS_M).abs() < 1e-5);
+        assert!((view_params.central_angle - PRIMARY_MONITOR_ARC_RAD).abs() < 1e-5);
+        let view_pos = Vec3::new(
+            view_params.pose.position.x,
+            view_params.pose.position.y,
+            view_params.pose.position.z,
+        );
+        assert!((view_pos - head_from_cyl.w_axis.truncate()).length() < 1e-5);
+    }
+
+    #[test]
+    fn head_lock_reposition_updates_view_relative_offset() {
+        let mut screen = build_default_cylinder_screen(102, 1920, 1080);
+        let head1 =
+            Mat4::from_rotation_translation(Quat::from_rotation_y(0.5), Vec3::new(0.0, 1.6, 0.0));
+        screen.set_transform(head1);
+        let initial_lock = compute_head_lock_offset(head1, screen.world_from_cylinder);
+        assert!(initial_lock.w_axis.truncate().length() < 1e-5);
+
+        // User grabs the head-locked screen and shifts it +0.25m right and +0.10m up in view.
+        let grabbed_world = head1 * Mat4::from_translation(Vec3::new(0.25, 0.10, -0.15));
+        screen.set_transform(grabbed_world);
+        let head_lock = compute_head_lock_offset(head1, screen.world_from_cylinder);
+
+        // Walk & look elsewhere; screen stays at the new view-relative offset.
+        let head2 = Mat4::from_rotation_translation(
+            Quat::from_euler(glam::EulerRot::YXZ, -1.1, -0.45, 0.12),
+            Vec3::new(-3.0, 1.3, 4.0),
+        );
+        let world2 = resolve_head_locked_world(head2, head_lock);
+        let rel_in_head2 = head2.inverse() * world2;
+        assert!((rel_in_head2.w_axis.truncate() - Vec3::new(0.25, 0.10, -0.15)).length() < 1e-5);
     }
 }

@@ -94,7 +94,10 @@ impl AudioRouter {
             inner.active_clients += 1;
             if self.enabled && inner.active_clients == 1 {
                 inner.prev_sink = pactl_get_default_sink();
-                info!("Routing desktop audio to Quest 3 (saved default sink={:?})", inner.prev_sink);
+                info!(
+                    "Routing desktop audio to Quest 3 (saved default sink={:?})",
+                    inner.prev_sink
+                );
                 inner.handle = Some(spawn_virtual_sink_thread(self.packet_tx.clone()));
                 true
             } else {
@@ -110,13 +113,19 @@ impl AudioRouter {
                         let inner = router.inner.lock().expect("AudioRouter mutex poisoned");
                         if inner.active_clients > 0 {
                             route_all_streams_to_sink(VIRTUAL_SINK_NAME);
-                            info!("Switched default audio output to {} (PC audio muted)", VIRTUAL_SINK_NAME);
+                            info!(
+                                "Switched default audio output to {} (PC audio muted)",
+                                VIRTUAL_SINK_NAME
+                            );
                         }
                         return;
                     }
                     std::thread::sleep(Duration::from_millis(50));
                 }
-                warn!("Timed out waiting for PipeWire sink {} to appear", VIRTUAL_SINK_NAME);
+                warn!(
+                    "Timed out waiting for PipeWire sink {} to appear",
+                    VIRTUAL_SINK_NAME
+                );
             });
         }
 
@@ -184,8 +193,8 @@ fn run_virtual_sink_loop(
     let mainloop = std::rc::Rc::new(
         pw::main_loop::MainLoopBox::new(None).context("Failed to create PipeWire MainLoop")?,
     );
-    let context =
-        pw::context::ContextBox::new(mainloop.loop_(), None).context("Failed to create PW Context")?;
+    let context = pw::context::ContextBox::new(mainloop.loop_(), None)
+        .context("Failed to create PW Context")?;
     let core = context
         .connect(None)
         .context("Failed to connect to PipeWire core")?;
@@ -238,8 +247,8 @@ fn run_virtual_sink_loop(
             if let Some(bytes) = data.data() {
                 if offset + size <= bytes.len() {
                     let pcm_bytes = &bytes[offset..offset + size];
-                    for pair in pcm_bytes.chunks_exact(2) {
-                        pending.push(i16::from_le_bytes([pair[0], pair[1]]));
+                    for &pair in pcm_bytes.as_chunks::<2>().0 {
+                        pending.push(i16::from_le_bytes(pair));
                     }
                     while pending.len() >= CHUNK_SAMPLES {
                         let chunk_vec: Vec<i16> = pending.drain(..CHUNK_SAMPLES).collect();
@@ -319,7 +328,10 @@ fn pactl_get_default_sink() -> Option<String> {
 }
 
 fn sink_exists(name: &str) -> bool {
-    let Ok(out) = Command::new("pactl").args(["list", "short", "sinks"]).output() else {
+    let Ok(out) = Command::new("pactl")
+        .args(["list", "short", "sinks"])
+        .output()
+    else {
         return false;
     };
     if !out.status.success() {
@@ -358,6 +370,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires running PipeWire daemon and pactl"]
     fn virtual_sink_creates_and_cleans_up() {
         let (tx, _rx) = broadcast::channel(8);
         let mut handle = spawn_virtual_sink_thread(tx);
@@ -370,7 +383,10 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        assert!(appeared, "Virtual PipeWire sink did not appear in pactl list short sinks");
+        assert!(
+            appeared,
+            "Virtual PipeWire sink did not appear in pactl list short sinks"
+        );
 
         handle.stop_and_join();
 

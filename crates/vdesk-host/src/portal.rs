@@ -88,7 +88,10 @@ async fn try_start_session(
     let streams = response.streams().unwrap_or_default().to_vec();
     let pipewire_fd = screencast.open_pipe_wire_remote(&session).await?;
 
-    info!("Wayland portal session started with {} stream(s)", streams.len());
+    info!(
+        "Wayland portal session started with {} stream(s)",
+        streams.len()
+    );
     for s in &streams {
         info!(
             "  Stream node_id={}, size={:?}, pos={:?}",

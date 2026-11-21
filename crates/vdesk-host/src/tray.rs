@@ -9,8 +9,6 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-const SERVICE_NAME: &str = "vdesk-host.service";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ServiceState {
     Running,
@@ -31,7 +29,7 @@ impl ServiceState {
 
     fn dot_argb(self) -> [u8; 4] {
         match self {
-            ServiceState::Running => [255, 34, 197, 94],    // green
+            ServiceState::Running => [255, 34, 197, 94],   // green
             ServiceState::Starting => [255, 245, 158, 11], // amber
             ServiceState::Stopped => [255, 148, 163, 184], // slate gray
             ServiceState::Failed => [255, 239, 68, 68],    // red
@@ -138,9 +136,9 @@ impl Tray for VdeskTray {
     }
 }
 
-fn query_service_state() -> ServiceState {
+fn query_service_state(service_name: &str) -> ServiceState {
     let Ok(out) = Command::new("systemctl")
-        .args(["--user", "is-active", SERVICE_NAME])
+        .args(["--user", "is-active", service_name])
         .output()
     else {
         return ServiceState::Stopped;
@@ -153,23 +151,33 @@ fn query_service_state() -> ServiceState {
     }
 }
 
-fn run_systemctl(verb: &str) {
+fn run_systemctl(service_name: &str, verb: &str) {
     match Command::new("systemctl")
-        .args(["--user", verb, SERVICE_NAME])
+        .args(["--user", verb, service_name])
         .status()
     {
-        Ok(st) if st.success() => info!("systemctl --user {} {} succeeded", verb, SERVICE_NAME),
+        Ok(st) if st.success() => info!("systemctl --user {} {} succeeded", verb, service_name),
         Ok(st) => warn!(
             "systemctl --user {} {} exited with status {}",
-            verb, SERVICE_NAME, st
+            verb, service_name, st
         ),
         Err(e) => warn!("Failed to execute systemctl --user {}: {:#}", verb, e),
     }
 }
 
-pub async fn run_tray() -> Result<()> {
+async fn run_systemctl_and_query(service_name: &str, verb: &'static str) -> ServiceState {
+    let svc = service_name.to_string();
+    tokio::task::spawn_blocking(move || {
+        run_systemctl(&svc, verb);
+        query_service_state(&svc)
+    })
+    .await
+    .unwrap_or(ServiceState::Stopped)
+}
+
+pub async fn run_tray(service_name: String) -> Result<()> {
     let (action_tx, mut action_rx) = mpsc::unbounded_channel();
-    let initial_state = query_service_state();
+    let initial_state = query_service_state(&service_name);
 
     let mut handle = None;
     for attempt in 0..10 {
@@ -193,7 +201,8 @@ pub async fn run_tray() -> Result<()> {
     }
     let handle = handle.expect("tray handle initialized");
     info!(
-        "VirtualRustTop system tray active (initial state: {})",
+        "VirtualRustTop system tray active for {} (initial state: {})",
+        service_name,
         initial_state.label()
     );
 
@@ -210,7 +219,8 @@ pub async fn run_tray() -> Result<()> {
                 break;
             }
             _ = poll_tick.tick() => {
-                let st = tokio::task::spawn_blocking(query_service_state)
+                let svc = service_name.clone();
+                let st = tokio::task::spawn_blocking(move || query_service_state(&svc))
                     .await
                     .unwrap_or(current_state);
                 if st != current_state {
@@ -222,27 +232,18 @@ pub async fn run_tray() -> Result<()> {
                 match action {
                     TrayAction::Start => {
                         let _ = handle.update(|t| t.state = ServiceState::Starting).await;
-                        let _ = tokio::task::spawn_blocking(|| run_systemctl("start")).await;
-                        let st = tokio::task::spawn_blocking(query_service_state)
-                            .await
-                            .unwrap_or(ServiceState::Stopped);
+                        let st = run_systemctl_and_query(&service_name, "start").await;
                         current_state = st;
                         let _ = handle.update(move |t| t.state = st).await;
                     }
                     TrayAction::Stop => {
-                        let _ = tokio::task::spawn_blocking(|| run_systemctl("stop")).await;
-                        let st = tokio::task::spawn_blocking(query_service_state)
-                            .await
-                            .unwrap_or(ServiceState::Stopped);
+                        let st = run_systemctl_and_query(&service_name, "stop").await;
                         current_state = st;
                         let _ = handle.update(move |t| t.state = st).await;
                     }
                     TrayAction::Restart => {
                         let _ = handle.update(|t| t.state = ServiceState::Starting).await;
-                        let _ = tokio::task::spawn_blocking(|| run_systemctl("restart")).await;
-                        let st = tokio::task::spawn_blocking(query_service_state)
-                            .await
-                            .unwrap_or(ServiceState::Stopped);
+                        let st = run_systemctl_and_query(&service_name, "restart").await;
                         current_state = st;
                         let _ = handle.update(move |t| t.state = st).await;
                     }
@@ -273,9 +274,9 @@ fn render_vr_icon(state: ServiceState) -> Icon {
     // Dark rounded square badge (3..28)
     for y in 2..30 {
         for x in 2..30 {
-            let corner = (x < 6 || x > 25) && (y < 6 || y > 25);
+            let corner = !(6..=25).contains(&x) && !(6..=25).contains(&y);
             let extreme = (x == 2 || x == 29) && (y == 2 || y == 29);
-            if extreme || (corner && ((x == 2 || x == 29) && (y < 5 || y > 26))) {
+            if extreme || (corner && ((x == 2 || x == 29) && !(5..=26).contains(&y))) {
                 continue;
             }
             let border = x == 2 || x == 29 || y == 2 || y == 29;
@@ -296,7 +297,9 @@ fn render_vr_icon(state: ServiceState) -> Icon {
             if nose_cutout || outer_corner {
                 continue;
             }
-            let inner = (8..24).contains(&x) && (13..18).contains(&y) && !(y >= 16 && (13..=18).contains(&x));
+            let inner = (8..24).contains(&x)
+                && (13..18).contains(&y)
+                && !(y >= 16 && (13..=18).contains(&x));
             let col = if inner {
                 [255, 56, 189, 248]
             } else {

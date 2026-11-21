@@ -4,6 +4,7 @@ use crate::nvenc::{
     NV_ENC_BUFFER_FORMAT_ABGR,
 };
 use anyhow::{Context, Result};
+use bytes::Bytes;
 use libspa::buffer::{ChunkFlags, DataType};
 use libspa::param::format::{MediaSubtype, MediaType};
 use libspa::param::video::{VideoFormat, VideoInfoRaw};
@@ -23,10 +24,10 @@ use pipewire::stream::{StreamBox, StreamFlags};
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::fd::{OwnedFd, RawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use tokio::sync::mpsc;
+use std::time::{Duration, Instant};
+use tokio::sync::broadcast;
 use tracing::{debug, error, info, warn};
 use vdesk_protocol::VideoCodec;
 
@@ -38,7 +39,65 @@ pub struct EncodedFrame {
     pub frame_index: u64,
     pub capture_timestamp_us: u64,
     pub is_idr: bool,
-    pub payload: Vec<u8>,
+    pub payload: Bytes,
+}
+
+pub struct StreamControl {
+    pub force_idr: AtomicBool,
+    pub target_bitrate_kbps: AtomicU32,
+    pub active: AtomicBool,
+    pub default_bitrate_kbps: AtomicU32,
+    pub min_bitrate_kbps: AtomicU32,
+    pub max_bitrate_kbps: AtomicU32,
+}
+
+impl StreamControl {
+    pub fn new(default_kbps: u32, min_kbps: u32, max_kbps: u32) -> Self {
+        Self {
+            force_idr: AtomicBool::new(false),
+            target_bitrate_kbps: AtomicU32::new(default_kbps),
+            active: AtomicBool::new(true),
+            default_bitrate_kbps: AtomicU32::new(default_kbps),
+            min_bitrate_kbps: AtomicU32::new(min_kbps),
+            max_bitrate_kbps: AtomicU32::new(max_kbps),
+        }
+    }
+
+    pub fn update_bounds(&self, default_kbps: u32, min_kbps: u32, max_kbps: u32) {
+        self.default_bitrate_kbps
+            .store(default_kbps, Ordering::Relaxed);
+        self.min_bitrate_kbps.store(min_kbps, Ordering::Relaxed);
+        self.max_bitrate_kbps.store(max_kbps, Ordering::Relaxed);
+        self.target_bitrate_kbps
+            .store(default_kbps, Ordering::Relaxed);
+    }
+
+    pub fn default_kbps(&self) -> u32 {
+        self.default_bitrate_kbps.load(Ordering::Relaxed)
+    }
+
+    pub fn min_kbps(&self) -> u32 {
+        self.min_bitrate_kbps.load(Ordering::Relaxed)
+    }
+
+    pub fn max_kbps(&self) -> u32 {
+        self.max_bitrate_kbps.load(Ordering::Relaxed)
+    }
+}
+
+pub fn default_bitrate_bounds(
+    width: u32,
+    height: u32,
+    override_kbps: Option<u32>,
+) -> (u32, u32, u32) {
+    let pixels = u64::from(width.max(1)) * u64::from(height.max(1));
+    let default = match override_kbps {
+        Some(v) => v.clamp(6_000, 120_000),
+        None => ((pixels * 35_000) / (2560 * 1440)).clamp(15_000, 60_000) as u32,
+    };
+    let min = (default / 4).clamp(6_000, 12_000).min(default);
+    let max = (default * 7 / 4).clamp(default, 80_000.max(default));
+    (default, min, max)
 }
 
 struct RegisteredDmaBuf {
@@ -57,6 +116,8 @@ struct TargetResources {
 struct CaptureState {
     stream_id: u32,
     codec: VideoCodec,
+    max_fps: u32,
+    bitrate_override: Option<u32>,
     bitrate_kbps: u32,
     width: u32,
     height: u32,
@@ -68,9 +129,11 @@ struct CaptureState {
     target: Option<TargetResources>,
     registered: HashMap<RawFd, RegisteredDmaBuf>,
     frame_index: u64,
-    force_idr: Arc<AtomicBool>,
+    control: Arc<StreamControl>,
+    active_clients: Arc<AtomicUsize>,
+    last_encoded_at: Option<Instant>,
     start_time: Instant,
-    frame_tx: mpsc::Sender<EncodedFrame>,
+    frame_tx: broadcast::Sender<Arc<EncodedFrame>>,
 }
 
 impl CaptureState {
@@ -118,13 +181,16 @@ impl Drop for CaptureHandle {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_capture_thread(
     pipewire_fd: Option<OwnedFd>,
     node_id: u32,
     codec: VideoCodec,
-    bitrate_kbps: u32,
-    force_idr: Arc<AtomicBool>,
-    frame_tx: mpsc::Sender<EncodedFrame>,
+    max_fps: u32,
+    bitrate_override: Option<u32>,
+    control: Arc<StreamControl>,
+    active_clients: Arc<AtomicUsize>,
+    frame_tx: broadcast::Sender<Arc<EncodedFrame>>,
 ) -> CaptureHandle {
     let (quit_tx, quit_rx) = pipewire::channel::channel();
     let join = std::thread::spawn(move || {
@@ -132,8 +198,10 @@ pub fn spawn_capture_thread(
             pipewire_fd,
             node_id,
             codec,
-            bitrate_kbps,
-            force_idr,
+            max_fps,
+            bitrate_override,
+            control,
+            active_clients,
             frame_tx,
             quit_rx,
         )
@@ -144,20 +212,26 @@ pub fn spawn_capture_thread(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_pipewire_loop(
     pipewire_fd: Option<OwnedFd>,
     node_id: u32,
     codec: VideoCodec,
-    bitrate_kbps: u32,
-    force_idr: Arc<AtomicBool>,
-    frame_tx: mpsc::Sender<EncodedFrame>,
+    max_fps: u32,
+    bitrate_override: Option<u32>,
+    control: Arc<StreamControl>,
+    active_clients: Arc<AtomicUsize>,
+    frame_tx: broadcast::Sender<Arc<EncodedFrame>>,
     quit_rx: pipewire::channel::Receiver<()>,
 ) -> Result<()> {
     pipewire::init();
 
     let egl = EglDmaBufImporter::new()?;
     let modifiers = egl.query_dmabuf_modifiers(DRM_FORMAT_XRGB8888);
-    info!("Queried {} EGL DMA-BUF modifiers for XRGB8888", modifiers.len());
+    info!(
+        "Queried {} EGL DMA-BUF modifiers for XRGB8888",
+        modifiers.len()
+    );
     let cuda = CudaEglInterop::new()?;
 
     let mainloop =
@@ -183,10 +257,13 @@ fn run_pipewire_loop(
     )
     .context("Failed to create PipeWire stream")?;
 
+    let initial_kbps = control.default_kbps();
     let state = CaptureState {
         stream_id: node_id,
         codec,
-        bitrate_kbps,
+        max_fps: max_fps.max(30),
+        bitrate_override,
+        bitrate_kbps: initial_kbps,
         width: 0,
         height: 0,
         drm_fourcc: DRM_FORMAT_XRGB8888,
@@ -197,7 +274,9 @@ fn run_pipewire_loop(
         target: None,
         registered: HashMap::new(),
         frame_index: 0,
-        force_idr,
+        control,
+        active_clients,
+        last_encoded_at: None,
         start_time: Instant::now(),
         frame_tx,
     };
@@ -234,7 +313,12 @@ fn run_pipewire_loop(
 
             info!(
                 "PipeWire stream {} negotiated {}x{} fmt={:?} (fourcc=0x{:08x}, mod=0x{:016x})",
-                state.stream_id, size.width, size.height, info.format(), fourcc, modifier
+                state.stream_id,
+                size.width,
+                size.height,
+                info.format(),
+                fourcc,
+                modifier
             );
 
             if state.width != size.width
@@ -250,11 +334,16 @@ fn run_pipewire_loop(
                 state.drm_fourcc = fourcc;
                 state.drm_modifier = modifier;
 
-                let fps = if info.framerate().denom > 0 {
-                    (info.framerate().num / info.framerate().denom).max(30)
+                let fps = if info.framerate().num > 0 && info.framerate().denom > 0 {
+                    (info.framerate().num / info.framerate().denom).clamp(30, state.max_fps)
                 } else {
-                    90
+                    state.max_fps
                 };
+
+                let (def_kbps, min_kbps, max_kbps) =
+                    default_bitrate_bounds(size.width, size.height, state.bitrate_override);
+                state.control.update_bounds(def_kbps, min_kbps, max_kbps);
+                state.bitrate_kbps = def_kbps;
 
                 let enc = match NvEncSession::new(
                     state.cuda.ctx,
@@ -272,7 +361,9 @@ fn run_pipewire_loop(
                     }
                 };
 
-                let dst_gl_tex = match state.egl.create_cuda_target_texture(size.width, size.height)
+                let dst_gl_tex = match state
+                    .egl
+                    .create_cuda_target_texture(size.width, size.height)
                 {
                     Ok(tex) => tex,
                     Err(e) => {
@@ -363,6 +454,32 @@ fn run_pipewire_loop(
                 return;
             }
 
+            let has_clients = state.active_clients.load(Ordering::Relaxed) > 0;
+            let is_active = state.control.active.load(Ordering::Relaxed);
+            let wants_idr = state.control.force_idr.load(Ordering::Acquire);
+            let now = Instant::now();
+
+            if !has_clients {
+                let idle_keepalive = state.frame_index == 0
+                    || state
+                        .last_encoded_at
+                        .is_none_or(|t| now.duration_since(t) >= Duration::from_secs(2));
+                if !idle_keepalive {
+                    return;
+                }
+            } else if !is_active {
+                if state.frame_index != 0 {
+                    return;
+                }
+            } else if !wants_idr {
+                let min_interval_us = (1_000_000u64 / u64::from(state.max_fps.max(1))) * 92 / 100;
+                if let Some(last) = state.last_encoded_at {
+                    if (now.duration_since(last).as_micros() as u64) < min_interval_us {
+                        return;
+                    }
+                }
+            }
+
             let (Some(ref mut nvenc), Some(ref target)) = (&mut state.nvenc, &state.target) else {
                 return;
             };
@@ -409,9 +526,10 @@ fn run_pipewire_loop(
                 }
             };
 
-            if let Err(e) = state
-                .egl
-                .blit_to_target(src_tex, target.dst_gl_tex, state.width, state.height)
+            if let Err(e) =
+                state
+                    .egl
+                    .blit_to_target(src_tex, target.dst_gl_tex, state.width, state.height)
             {
                 error!("GL DMA-BUF blit failed: {:#}", e);
                 return;
@@ -422,8 +540,20 @@ fn run_pipewire_loop(
                 return;
             }
 
+            let desired_kbps = state.control.target_bitrate_kbps.load(Ordering::Relaxed);
+            if desired_kbps != state.bitrate_kbps && desired_kbps >= 2_000 {
+                match nvenc.reconfigure_bitrate(desired_kbps) {
+                    Ok(()) => state.bitrate_kbps = desired_kbps,
+                    Err(e) => warn!(
+                        "NVENC bitrate reconfigure ({} kbps) failed for stream {}: {:#}",
+                        desired_kbps, state.stream_id, e
+                    ),
+                }
+            }
+
             let ts_us = state.start_time.elapsed().as_micros() as u64;
-            let is_idr = state.force_idr.swap(false, Ordering::AcqRel) || state.frame_index % 240 == 0;
+            let is_idr =
+                state.frame_index == 0 || state.control.force_idr.swap(false, Ordering::AcqRel);
             let encode_res = nvenc.encode_registered_frame(target.nvenc_res, ts_us, is_idr);
             if let Err(e) = state.cuda.unmap_resource(target.cuda_res) {
                 error!("CUDA unmap_resource failed: {:#}", e);
@@ -431,19 +561,18 @@ fn run_pipewire_loop(
 
             match encode_res {
                 Ok(payload) if !payload.is_empty() => {
-                    let frame = EncodedFrame {
+                    state.last_encoded_at = Some(now);
+                    let frame = Arc::new(EncodedFrame {
                         stream_id: state.stream_id,
                         width: state.width,
                         height: state.height,
                         frame_index: state.frame_index,
                         capture_timestamp_us: ts_us,
                         is_idr,
-                        payload,
-                    };
+                        payload: Bytes::from(payload),
+                    });
                     state.frame_index += 1;
-                    if state.frame_tx.try_send(frame).is_err() {
-                        state.force_idr.store(true, Ordering::Release);
-                    }
+                    let _ = state.frame_tx.send(frame);
                 }
                 Ok(_) => {}
                 Err(e) => {
@@ -455,7 +584,7 @@ fn run_pipewire_loop(
         .context("Failed to register PipeWire stream listener")?;
 
     let mut format_buf = Vec::new();
-    let format_bytes = build_video_format_params(&mut format_buf, &modifiers)?;
+    let format_bytes = build_video_format_params(&mut format_buf, &modifiers, max_fps.max(30))?;
     let format_pod = Pod::from_bytes(format_bytes).context("Invalid format POD")?;
 
     stream
@@ -479,7 +608,11 @@ fn run_pipewire_loop(
     Ok(())
 }
 
-fn build_video_format_params<'a>(buf: &'a mut Vec<u8>, modifiers: &[u64]) -> Result<&'a [u8]> {
+fn build_video_format_params<'a>(
+    buf: &'a mut Vec<u8>,
+    modifiers: &[u64],
+    max_fps: u32,
+) -> Result<&'a [u8]> {
     let mod_alts: Vec<i64> = if modifiers.is_empty() {
         vec![0, DRM_FORMAT_MOD_INVALID as i64]
     } else {
@@ -551,9 +684,15 @@ fn build_video_format_params<'a>(buf: &'a mut Vec<u8>, modifiers: &[u64]) -> Res
                 Value::Choice(ChoiceValue::Fraction(Choice(
                     ChoiceFlags::empty(),
                     ChoiceEnum::Range {
-                        default: Fraction { num: 90, denom: 1 },
+                        default: Fraction {
+                            num: max_fps,
+                            denom: 1,
+                        },
                         min: Fraction { num: 0, denom: 1 },
-                        max: Fraction { num: 240, denom: 1 },
+                        max: Fraction {
+                            num: max_fps,
+                            denom: 1,
+                        },
                     },
                 ))),
             ),

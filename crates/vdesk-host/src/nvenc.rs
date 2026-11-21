@@ -3,14 +3,19 @@
 //! Links dynamically at runtime to `libEGL.so.1`, `libcuda.so.1`, and `libnvidia-encode.so.1`
 //! so no compile-time NVIDIA Video Codec SDK headers are required.
 
-#![allow(non_camel_case_types, non_snake_case, dead_code)]
+#![allow(
+    non_camel_case_types,
+    non_snake_case,
+    dead_code,
+    clippy::upper_case_acronyms
+)]
 
 use anyhow::{anyhow, bail, Context, Result};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr};
 use std::os::fd::RawFd;
 use std::ptr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use vdesk_protocol::VideoCodec;
 
 // ---------------------------------------------------------------------------
@@ -103,6 +108,7 @@ pub struct EglDmaBufImporter {
         c_uint,
         *const c_void,
     ),
+    gl_flush: unsafe extern "C" fn(),
     gl_finish: unsafe extern "C" fn(),
     gl_get_error: unsafe extern "C" fn() -> c_uint,
     gl_egl_image_target_texture_2d_oes: unsafe extern "C" fn(c_uint, EGLImageKHR),
@@ -127,6 +133,7 @@ pub struct EglDmaBufImporter {
 }
 
 impl EglDmaBufImporter {
+    #[allow(clippy::missing_transmute_annotations)]
     pub fn new() -> Result<Self> {
         unsafe {
             let lib = Library::new("libEGL.so.1").context("Failed to load libEGL.so.1")?;
@@ -136,9 +143,8 @@ impl EglDmaBufImporter {
             let egl_initialize: Symbol<
                 unsafe extern "C" fn(EGLDisplay, *mut EGLint, *mut EGLint) -> EGLBoolean,
             > = lib.get(b"eglInitialize")?;
-            let egl_get_proc_address: Symbol<
-                unsafe extern "C" fn(*const c_char) -> *mut c_void,
-            > = lib.get(b"eglGetProcAddress")?;
+            let egl_get_proc_address: Symbol<unsafe extern "C" fn(*const c_char) -> *mut c_void> =
+                lib.get(b"eglGetProcAddress")?;
             let egl_bind_api: Symbol<unsafe extern "C" fn(EGLenum) -> EGLBoolean> =
                 lib.get(b"eglBindAPI")?;
             let egl_create_context: Symbol<
@@ -152,7 +158,12 @@ impl EglDmaBufImporter {
             let egl_destroy_context: unsafe extern "C" fn(EGLDisplay, EGLContext) -> EGLBoolean =
                 *lib.get(b"eglDestroyContext")?;
             let egl_make_current: Symbol<
-                unsafe extern "C" fn(EGLDisplay, *mut c_void, *mut c_void, EGLContext) -> EGLBoolean,
+                unsafe extern "C" fn(
+                    EGLDisplay,
+                    *mut c_void,
+                    *mut c_void,
+                    EGLContext,
+                ) -> EGLBoolean,
             > = lib.get(b"eglMakeCurrent")?;
 
             // Prefer EGL_PLATFORM_DEVICE_EXT so NVIDIA's EGLDevice is selected directly
@@ -185,7 +196,10 @@ impl EglDmaBufImporter {
                             let mut min = 0;
                             if egl_initialize(dpy, &mut maj, &mut min) == EGL_TRUE {
                                 display = dpy;
-                                info!("Initialized NVIDIA/Platform EGL {}.{} via EGLDevice", maj, min);
+                                info!(
+                                    "Initialized NVIDIA/Platform EGL {}.{} via EGLDevice",
+                                    maj, min
+                                );
                                 break;
                             }
                         }
@@ -255,6 +269,7 @@ impl EglDmaBufImporter {
             let gl_bind_texture = *gl_lib.get(b"glBindTexture")?;
             let gl_tex_parameteri = *gl_lib.get(b"glTexParameteri")?;
             let gl_tex_image_2d = *gl_lib.get(b"glTexImage2D")?;
+            let gl_flush = *gl_lib.get(b"glFlush")?;
             let gl_finish = *gl_lib.get(b"glFinish")?;
             let gl_get_error = *gl_lib.get(b"glGetError")?;
 
@@ -277,6 +292,7 @@ impl EglDmaBufImporter {
                 gl_bind_texture,
                 gl_tex_parameteri,
                 gl_tex_image_2d,
+                gl_flush,
                 gl_finish,
                 gl_get_error,
                 gl_egl_image_target_texture_2d_oes: std::mem::transmute(target_tex_ptr),
@@ -352,12 +368,16 @@ impl EglDmaBufImporter {
                 if tex != 0 {
                     (self.gl_delete_textures)(1, &tex);
                 }
-                bail!("create_cuda_target_texture failed with GL error 0x{:x}", err);
+                bail!(
+                    "create_cuda_target_texture failed with GL error 0x{:x}",
+                    err
+                );
             }
             Ok(tex)
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn import_dmabuf_texture(
         &self,
         fd: RawFd,
@@ -430,7 +450,7 @@ impl EglDmaBufImporter {
             );
             (self.gl_bind_framebuffer)(GL_READ_FRAMEBUFFER, 0);
             (self.gl_bind_framebuffer)(GL_DRAW_FRAMEBUFFER, 0);
-            (self.gl_finish)();
+            (self.gl_flush)();
             let err = (self.gl_get_error)();
             if err != 0 {
                 bail!("glBlitFramebuffer failed with GL error 0x{:x}", err);
@@ -452,6 +472,7 @@ impl EglDmaBufImporter {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn import_dmabuf(
         &self,
         fd: RawFd,
@@ -574,40 +595,19 @@ pub enum CudaMappedFrame {
 pub struct CudaEglInterop {
     _lib: Library,
     pub ctx: CUcontext,
-    cu_graphics_egl_register_image: unsafe extern "C" fn(
-        *mut CUgraphicsResource,
-        EGLImageKHR,
-        c_uint,
-    ) -> CUresult,
-    cu_graphics_gl_register_image: unsafe extern "C" fn(
-        *mut CUgraphicsResource,
-        c_uint,
-        c_uint,
-        c_uint,
-    ) -> CUresult,
-    cu_graphics_map_resources: unsafe extern "C" fn(
-        c_uint,
-        *mut CUgraphicsResource,
-        *mut c_void,
-    ) -> CUresult,
-    cu_graphics_unmap_resources: unsafe extern "C" fn(
-        c_uint,
-        *mut CUgraphicsResource,
-        *mut c_void,
-    ) -> CUresult,
-    cu_graphics_sub_resource_get_mapped_array: unsafe extern "C" fn(
-        *mut CUarray,
-        CUgraphicsResource,
-        c_uint,
-        c_uint,
-    ) -> CUresult,
+    cu_graphics_egl_register_image:
+        unsafe extern "C" fn(*mut CUgraphicsResource, EGLImageKHR, c_uint) -> CUresult,
+    cu_graphics_gl_register_image:
+        unsafe extern "C" fn(*mut CUgraphicsResource, c_uint, c_uint, c_uint) -> CUresult,
+    cu_graphics_map_resources:
+        unsafe extern "C" fn(c_uint, *mut CUgraphicsResource, *mut c_void) -> CUresult,
+    cu_graphics_unmap_resources:
+        unsafe extern "C" fn(c_uint, *mut CUgraphicsResource, *mut c_void) -> CUresult,
+    cu_graphics_sub_resource_get_mapped_array:
+        unsafe extern "C" fn(*mut CUarray, CUgraphicsResource, c_uint, c_uint) -> CUresult,
     cu_graphics_unregister_resource: unsafe extern "C" fn(CUgraphicsResource) -> CUresult,
-    cu_graphics_resource_get_mapped_egl_frame: unsafe extern "C" fn(
-        *mut CUeglFrame,
-        CUgraphicsResource,
-        c_uint,
-        c_uint,
-    ) -> CUresult,
+    cu_graphics_resource_get_mapped_egl_frame:
+        unsafe extern "C" fn(*mut CUeglFrame, CUgraphicsResource, c_uint, c_uint) -> CUresult,
     cu_ctx_push_current: unsafe extern "C" fn(CUcontext) -> CUresult,
 }
 
@@ -709,9 +709,8 @@ impl CudaEglInterop {
             bail!("cuGraphicsMapResources failed: {}", res);
         }
         let mut arr: CUarray = ptr::null_mut();
-        let res = unsafe {
-            (self.cu_graphics_sub_resource_get_mapped_array)(&mut arr, resource, 0, 0)
-        };
+        let res =
+            unsafe { (self.cu_graphics_sub_resource_get_mapped_array)(&mut arr, resource, 0, 0) };
         if res != CUDA_SUCCESS {
             unsafe {
                 (self.cu_graphics_unmap_resources)(1, &mut resource, ptr::null_mut());
@@ -796,6 +795,7 @@ impl CudaEglInterop {
 
 type NVENCSTATUS = c_int;
 const NV_ENC_SUCCESS: NVENCSTATUS = 0;
+const NV_ENC_ERR_INVALID_VERSION: NVENCSTATUS = 15;
 
 // NVENCAPI_MAJOR_VERSION = 12, NVENCAPI_MINOR_VERSION = 2
 const NVENCAPI_MAJOR_VERSION: u32 = 12;
@@ -843,6 +843,7 @@ const NV_ENC_PRESET_P1_GUID: GUID = GUID {
 
 const NV_ENC_DEVICE_TYPE_CUDA: u32 = 1;
 const NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY: u32 = 3;
+const NV_ENC_PARAMS_RC_VBR: u32 = 1;
 const NV_ENC_PARAMS_RC_CBR: u32 = 2;
 const NVENC_INFINITE_GOPLENGTH: u32 = 0xFFFF_FFFF;
 
@@ -924,6 +925,7 @@ struct NV_ENC_PRESET_CONFIG {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct NV_ENC_INITIALIZE_PARAMS {
     version: u32,
     encodeGUID: GUID,
@@ -950,6 +952,14 @@ struct NV_ENC_INITIALIZE_PARAMS {
     outputStatsLevel: u32,
     reserved1: [u32; 284],
     reserved2: [*mut c_void; 64],
+}
+
+#[repr(C)]
+struct NV_ENC_RECONFIGURE_PARAMS {
+    version: u32,
+    reserved: u32,
+    reInitEncodeParams: NV_ENC_INITIALIZE_PARAMS,
+    bitfields: u32,
 }
 
 #[repr(C)]
@@ -1064,47 +1074,84 @@ struct NV_ENC_LOCK_BITSTREAM {
 struct NV_ENCODE_API_FUNCTION_LIST {
     version: u32,
     reserved: u32,
-    nvEncOpenEncodeSession: Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> NVENCSTATUS>,
+    nvEncOpenEncodeSession:
+        Option<unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> NVENCSTATUS>,
     nvEncGetEncodeGUIDCount: Option<unsafe extern "C" fn(*mut c_void, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeProfileGUIDCount: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeProfileGUIDs: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeGUIDs: Option<unsafe extern "C" fn(*mut c_void, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetInputFormatCount: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
-    nvEncGetInputFormats: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodeCaps: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut c_void, *mut c_int) -> NVENCSTATUS>,
-    nvEncGetEncodePresetCount: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodePresetGUIDs: Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
-    nvEncGetEncodePresetConfig: Option<unsafe extern "C" fn(*mut c_void, GUID, GUID, *mut NV_ENC_PRESET_CONFIG) -> NVENCSTATUS>,
-    nvEncInitializeEncoder: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_INITIALIZE_PARAMS) -> NVENCSTATUS>,
+    nvEncGetEncodeProfileGUIDCount:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodeProfileGUIDs:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodeGUIDs:
+        Option<unsafe extern "C" fn(*mut c_void, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetInputFormatCount:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
+    nvEncGetInputFormats:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodeCaps:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut c_void, *mut c_int) -> NVENCSTATUS>,
+    nvEncGetEncodePresetCount:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodePresetGUIDs:
+        Option<unsafe extern "C" fn(*mut c_void, GUID, *mut GUID, u32, *mut u32) -> NVENCSTATUS>,
+    nvEncGetEncodePresetConfig: Option<
+        unsafe extern "C" fn(*mut c_void, GUID, GUID, *mut NV_ENC_PRESET_CONFIG) -> NVENCSTATUS,
+    >,
+    nvEncInitializeEncoder:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_INITIALIZE_PARAMS) -> NVENCSTATUS>,
     nvEncCreateInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncDestroyInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncCreateBitstreamBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_BITSTREAM_BUFFER) -> NVENCSTATUS>,
-    nvEncDestroyBitstreamBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncEncodePicture: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_PIC_PARAMS) -> NVENCSTATUS>,
-    nvEncLockBitstream: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_BITSTREAM) -> NVENCSTATUS>,
+    nvEncCreateBitstreamBuffer: Option<
+        unsafe extern "C" fn(*mut c_void, *mut NV_ENC_CREATE_BITSTREAM_BUFFER) -> NVENCSTATUS,
+    >,
+    nvEncDestroyBitstreamBuffer:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncEncodePicture:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_PIC_PARAMS) -> NVENCSTATUS>,
+    nvEncLockBitstream:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_LOCK_BITSTREAM) -> NVENCSTATUS>,
     nvEncUnlockBitstream: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncLockInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncUnlockInputBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncGetEncodeStats: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncGetSequenceParams: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncRegisterAsyncEvent: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncUnregisterAsyncEvent: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncMapInputResource: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_MAP_INPUT_RESOURCE) -> NVENCSTATUS>,
+    nvEncUnregisterAsyncEvent:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncMapInputResource:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_MAP_INPUT_RESOURCE) -> NVENCSTATUS>,
     nvEncUnmapInputResource: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncDestroyEncoder: Option<unsafe extern "C" fn(*mut c_void) -> NVENCSTATUS>,
     nvEncInvalidateRefFrames: Option<unsafe extern "C" fn(*mut c_void, u64) -> NVENCSTATUS>,
-    nvEncOpenEncodeSessionEx: Option<unsafe extern "C" fn(*mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS, *mut *mut c_void) -> NVENCSTATUS>,
-    nvEncRegisterResource: Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_REGISTER_RESOURCE) -> NVENCSTATUS>,
+    nvEncOpenEncodeSessionEx: Option<
+        unsafe extern "C" fn(
+            *mut NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS,
+            *mut *mut c_void,
+        ) -> NVENCSTATUS,
+    >,
+    nvEncRegisterResource:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_REGISTER_RESOURCE) -> NVENCSTATUS>,
     nvEncUnregisterResource: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncReconfigureEncoder: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncReconfigureEncoder:
+        Option<unsafe extern "C" fn(*mut c_void, *mut NV_ENC_RECONFIGURE_PARAMS) -> NVENCSTATUS>,
     reserved1: *mut c_void,
     nvEncCreateMVBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncDestroyMVBuffer: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncRunMotionEstimationOnly: Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncRunMotionEstimationOnly:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void) -> NVENCSTATUS>,
     nvEncGetLastErrorString: Option<unsafe extern "C" fn(*mut c_void) -> *const c_char>,
-    nvEncSetIOCudaStreams: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> NVENCSTATUS>,
-    nvEncGetEncodePresetConfigEx: Option<unsafe extern "C" fn(*mut c_void, GUID, GUID, u32, *mut NV_ENC_PRESET_CONFIG) -> NVENCSTATUS>,
-    nvEncGetSequenceParamEx: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncSetIOCudaStreams:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> NVENCSTATUS>,
+    nvEncGetEncodePresetConfigEx: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            GUID,
+            GUID,
+            u32,
+            *mut NV_ENC_PRESET_CONFIG,
+        ) -> NVENCSTATUS,
+    >,
+    nvEncGetSequenceParamEx:
+        Option<unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> NVENCSTATUS>,
     reserved2: [*mut c_void; 279],
 }
 
@@ -1113,11 +1160,34 @@ pub struct NvEncSession {
     fn_list: Box<NV_ENCODE_API_FUNCTION_LIST>,
     encoder: *mut c_void,
     bitstream_buffer: *mut c_void,
+    encode_config: Box<NV_ENC_CONFIG>,
+    init_params: NV_ENC_INITIALIZE_PARAMS,
     pub width: u32,
     pub height: u32,
+    pub fps: u32,
+    pub bitrate_kbps: u32,
     pub buffer_format: u32,
+    use_vbr: bool,
     frame_idx: u32,
     seq_header: Vec<u8>,
+}
+
+fn apply_rc_params(cfg: &mut NV_ENC_CONFIG, bitrate_kbps: u32, use_vbr: bool) {
+    let bps = bitrate_kbps.saturating_mul(1000);
+    if use_vbr {
+        cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_VBR;
+        cfg.rcParams.averageBitRate = bps;
+        // Allow 25% instantaneous burst headroom for motion scenes without blowing Wi-Fi pacing.
+        cfg.rcParams.maxBitRate = bitrate_kbps.saturating_mul(1250);
+    } else {
+        cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+        cfg.rcParams.averageBitRate = bps;
+        cfg.rcParams.maxBitRate = bps;
+    }
+    // 125 ms VBV pacing window keeps recovery IDRs smooth without creating burst spikes.
+    cfg.rcParams.vbvBufferSize = (bps / 8).max(1);
+    cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize / 2;
+    cfg.rcParams.lowDelayKeyFrameScale = 2;
 }
 
 /// Extract the `OBU_SEQUENCE_HEADER` OBU (type 1) from an AV1 Annex-B/low-overhead OBU stream.
@@ -1243,15 +1313,11 @@ impl NvEncSession {
             }
 
             // Configure Ultra-Low-Latency desktop streaming parameters
-            let cfg = &mut preset_config.presetCfg;
-            cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
-            cfg.frameIntervalP = 1; // Zero B-frames
-            cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
-            cfg.rcParams.averageBitRate = bitrate_kbps * 1000;
-            cfg.rcParams.maxBitRate = bitrate_kbps * 1000;
-            // 200 ms VBV window so IDR keyframes are not starved/macroblock-scattered under load
-            cfg.rcParams.vbvBufferSize = (bitrate_kbps * 1000) / 5;
-            cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize / 2;
+            let mut encode_config = Box::new(preset_config.presetCfg);
+            encode_config.gopLength = NVENC_INFINITE_GOPLENGTH;
+            encode_config.frameIntervalP = 1; // Zero B-frames
+            let mut use_vbr = true;
+            apply_rc_params(&mut encode_config, bitrate_kbps, use_vbr);
 
             let mut init_params: NV_ENC_INITIALIZE_PARAMS = std::mem::zeroed();
             init_params.version = nvenc_struct_version_ex(6);
@@ -1265,7 +1331,7 @@ impl NvEncSession {
             init_params.frameRateDen = 1;
             init_params.enableEncodeAsync = 0;
             init_params.enablePTD = 1;
-            init_params.encodeConfig = cfg;
+            init_params.encodeConfig = &mut *encode_config as *mut NV_ENC_CONFIG;
             init_params.maxEncodeWidth = width;
             init_params.maxEncodeHeight = height;
             init_params.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
@@ -1274,11 +1340,22 @@ impl NvEncSession {
             let init_fn = fn_list
                 .nvEncInitializeEncoder
                 .ok_or_else(|| anyhow!("Missing nvEncInitializeEncoder"))?;
-            let st = init_fn(encoder, &mut init_params);
+            let mut st = init_fn(encoder, &mut init_params);
             if st != NV_ENC_SUCCESS {
                 let err = Self::last_error(&fn_list, encoder);
-                Self::destroy_raw(&fn_list, encoder, ptr::null_mut());
-                bail!("nvEncInitializeEncoder failed: {} ({})", st, err);
+                warn!(
+                    "nvEncInitializeEncoder with VBR failed ({}: {}); retrying with CBR",
+                    st, err
+                );
+                use_vbr = false;
+                apply_rc_params(&mut encode_config, bitrate_kbps, use_vbr);
+                init_params.encodeConfig = &mut *encode_config as *mut NV_ENC_CONFIG;
+                st = init_fn(encoder, &mut init_params);
+                if st != NV_ENC_SUCCESS {
+                    let err2 = Self::last_error(&fn_list, encoder);
+                    Self::destroy_raw(&fn_list, encoder, ptr::null_mut());
+                    bail!("nvEncInitializeEncoder failed: {} ({})", st, err2);
+                }
             }
 
             let mut bs_params: NV_ENC_CREATE_BITSTREAM_BUFFER = std::mem::zeroed();
@@ -1294,8 +1371,13 @@ impl NvEncSession {
             }
 
             info!(
-                "Initialized NVENC {:?} {}x{} @ {}fps ({} kbps)",
-                codec, width, height, fps, bitrate_kbps
+                "Initialized NVENC {:?} {}x{} @ {}fps ({} kbps, {})",
+                codec,
+                width,
+                height,
+                fps,
+                bitrate_kbps,
+                if use_vbr { "VBR" } else { "CBR" }
             );
 
             Ok(Self {
@@ -1303,12 +1385,53 @@ impl NvEncSession {
                 fn_list,
                 encoder,
                 bitstream_buffer: bs_params.bitstreamBuffer,
+                encode_config,
+                init_params,
                 width,
                 height,
+                fps,
+                bitrate_kbps,
                 buffer_format,
+                use_vbr,
                 frame_idx: 0,
                 seq_header: Vec::new(),
             })
+        }
+    }
+
+    pub fn reconfigure_bitrate(&mut self, bitrate_kbps: u32) -> Result<()> {
+        let bitrate_kbps = bitrate_kbps.max(2_000);
+        if bitrate_kbps == self.bitrate_kbps {
+            return Ok(());
+        }
+        unsafe {
+            let reconf_fn = self
+                .fn_list
+                .nvEncReconfigureEncoder
+                .ok_or_else(|| anyhow!("Missing nvEncReconfigureEncoder"))?;
+
+            apply_rc_params(&mut self.encode_config, bitrate_kbps, self.use_vbr);
+            self.init_params.encodeConfig = &mut *self.encode_config as *mut NV_ENC_CONFIG;
+
+            let mut params: NV_ENC_RECONFIGURE_PARAMS = std::mem::zeroed();
+            params.version = nvenc_struct_version_ex(1);
+            params.reInitEncodeParams = self.init_params;
+            params.bitfields = 0;
+
+            let mut st = reconf_fn(self.encoder, &mut params);
+            if st == NV_ENC_ERR_INVALID_VERSION {
+                params.version = nvenc_struct_version(1);
+                st = reconf_fn(self.encoder, &mut params);
+            }
+            if st != NV_ENC_SUCCESS {
+                let err = Self::last_error(&self.fn_list, self.encoder);
+                // Revert config to previous bitrate on failure so state stays consistent.
+                apply_rc_params(&mut self.encode_config, self.bitrate_kbps, self.use_vbr);
+                self.init_params.encodeConfig = &mut *self.encode_config as *mut NV_ENC_CONFIG;
+                bail!("nvEncReconfigureEncoder failed: {} ({})", st, err);
+            }
+            self.bitrate_kbps = bitrate_kbps;
+            Ok(())
         }
     }
 
@@ -1345,7 +1468,10 @@ impl NvEncSession {
                     Self::last_error(&self.fn_list, self.encoder)
                 );
             }
-            debug!("Registered CUDA frame with NVENC: {:?}", reg.registeredResource);
+            debug!(
+                "Registered CUDA frame with NVENC: {:?}",
+                reg.registeredResource
+            );
             Ok(reg.registeredResource)
         }
     }
@@ -1454,7 +1580,11 @@ impl NvEncSession {
             } else if (force_idr || is_first) && extract_av1_seq_header(&bytes).is_none() {
                 // NVENC AV1 omits OBU_SEQUENCE_HEADER on subsequent forced IDRs; splice it
                 // right after the 2-byte OBU_TEMPORAL_DELIMITER (0x12, 0x00) if present.
-                let insert_at = if bytes.starts_with(&[0x12, 0x00]) { 2 } else { 0 };
+                let insert_at = if bytes.starts_with(&[0x12, 0x00]) {
+                    2
+                } else {
+                    0
+                };
                 let mut patched = Vec::with_capacity(bytes.len() + self.seq_header.len());
                 patched.extend_from_slice(&bytes[..insert_at]);
                 patched.extend_from_slice(&self.seq_header);
@@ -1509,10 +1639,10 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     #[test]
+    #[ignore = "requires NVIDIA GPU with EGL, CUDA, NVENC AV1, and /dev/dri/renderD128"]
     fn egl_device_and_modifiers_work() {
         let egl = EglDmaBufImporter::new().expect("EGL init");
         let mods = egl.query_dmabuf_modifiers(DRM_FORMAT_XRGB8888);
-        println!("EGL XRGB8888 modifiers ({}): {:x?}", mods.len(), mods);
         assert!(!mods.is_empty(), "Expected non-empty EGL DMA-BUF modifiers");
         assert!(
             mods.iter().all(|&m| m == 0 || ((m >> 23) & 0x7) == 0),
@@ -1521,6 +1651,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires NVIDIA GPU with EGL, CUDA, NVENC AV1, and /dev/dri/renderD128"]
     fn nvenc_av1_session_initializes() {
         let cuda = CudaEglInterop::new().expect("CUDA init");
         let _enc = NvEncSession::new(
@@ -1536,6 +1667,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires NVIDIA GPU with EGL, CUDA, NVENC AV1, and /dev/dri/renderD128"]
     fn dmabuf_to_nvenc_av1_encodes_frame() {
         let egl = EglDmaBufImporter::new().expect("EGL init");
         let cuda = CudaEglInterop::new().expect("CUDA init");
@@ -1587,15 +1719,10 @@ mod tests {
             let gbm = gbm_create_device(drm_file.as_raw_fd());
             assert!(!gbm.is_null(), "gbm_create_device failed");
 
-            let mod_val = 0x0300_0000_0060_6014u64;
-            let bo = gbm_bo_create_with_modifiers(
-                gbm,
-                width,
-                height,
-                DRM_FORMAT_XRGB8888,
-                &mod_val,
-                1,
-            );
+            let mods = egl.query_dmabuf_modifiers(DRM_FORMAT_XRGB8888);
+            let mod_val = mods.iter().copied().find(|&m| m != 0).unwrap_or(0);
+            let bo =
+                gbm_bo_create_with_modifiers(gbm, width, height, DRM_FORMAT_XRGB8888, &mod_val, 1);
             assert!(!bo.is_null(), "gbm_bo_create_with_modifiers failed");
 
             let dmabuf_fd = gbm_bo_get_fd(bo);
@@ -1636,7 +1763,6 @@ mod tests {
                     .encode_registered_frame(nvenc_res, idx * 11_111, force_idr)
                     .expect("encode_registered_frame");
                 cuda.unmap_resource(cuda_res).expect("unmap_resource");
-                println!("Frame {} encoded {} bytes of AV1", idx, bitstream.len());
                 assert!(!bitstream.is_empty(), "Expected non-empty AV1 bitstream");
                 if force_idr {
                     assert!(
@@ -1646,6 +1772,123 @@ mod tests {
                     );
                 }
             }
+
+            nvenc.unregister_resource(nvenc_res);
+            cuda.unregister_resource(cuda_res);
+            egl.destroy_texture(dst_tex);
+            egl.destroy_dmabuf_texture(egl_img, src_tex);
+            libc::close(dmabuf_fd);
+            gbm_bo_destroy(bo);
+            gbm_device_destroy(gbm);
+        }
+    }
+
+    #[test]
+    #[ignore = "requires NVIDIA GPU with EGL, CUDA, NVENC AV1, and /dev/dri/renderD128"]
+    fn nvenc_av1_reconfigure_bitrate_midstream() {
+        let egl = EglDmaBufImporter::new().expect("EGL init");
+        let cuda = CudaEglInterop::new().expect("CUDA init");
+
+        let width = 1280u32;
+        let height = 720u32;
+        let mut nvenc = NvEncSession::new(
+            cuda.ctx,
+            width,
+            height,
+            60,
+            25_000,
+            VideoCodec::Av1YUV420,
+            NV_ENC_BUFFER_FORMAT_ABGR,
+        )
+        .expect("NVENC AV1 init");
+
+        unsafe {
+            let drm_file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open("/dev/dri/renderD128")
+                .expect("open /dev/dri/renderD128");
+            let gbm_lib = Library::new("libgbm.so.1").expect("load libgbm.so.1");
+            let gbm_create_device: Symbol<unsafe extern "C" fn(c_int) -> *mut c_void> =
+                gbm_lib.get(b"gbm_create_device").unwrap();
+            let gbm_device_destroy: Symbol<unsafe extern "C" fn(*mut c_void)> =
+                gbm_lib.get(b"gbm_device_destroy").unwrap();
+            let gbm_bo_create_with_modifiers: Symbol<
+                unsafe extern "C" fn(
+                    *mut c_void,
+                    c_uint,
+                    c_uint,
+                    c_uint,
+                    *const u64,
+                    c_uint,
+                ) -> *mut c_void,
+            > = gbm_lib.get(b"gbm_bo_create_with_modifiers").unwrap();
+            let gbm_bo_destroy: Symbol<unsafe extern "C" fn(*mut c_void)> =
+                gbm_lib.get(b"gbm_bo_destroy").unwrap();
+            let gbm_bo_get_fd: Symbol<unsafe extern "C" fn(*mut c_void) -> c_int> =
+                gbm_lib.get(b"gbm_bo_get_fd").unwrap();
+            let gbm_bo_get_stride: Symbol<unsafe extern "C" fn(*mut c_void) -> c_uint> =
+                gbm_lib.get(b"gbm_bo_get_stride").unwrap();
+            let gbm_bo_get_modifier: Symbol<unsafe extern "C" fn(*mut c_void) -> u64> =
+                gbm_lib.get(b"gbm_bo_get_modifier").unwrap();
+
+            let gbm = gbm_create_device(drm_file.as_raw_fd());
+            assert!(!gbm.is_null(), "gbm_create_device failed");
+
+            let mods = egl.query_dmabuf_modifiers(DRM_FORMAT_XRGB8888);
+            let mod_val = mods.iter().copied().find(|&m| m != 0).unwrap_or(0);
+            let bo =
+                gbm_bo_create_with_modifiers(gbm, width, height, DRM_FORMAT_XRGB8888, &mod_val, 1);
+            assert!(!bo.is_null(), "gbm_bo_create_with_modifiers failed");
+
+            let dmabuf_fd = gbm_bo_get_fd(bo);
+            let stride = gbm_bo_get_stride(bo);
+            let actual_mod = gbm_bo_get_modifier(bo);
+
+            let (egl_img, src_tex) = egl
+                .import_dmabuf_texture(
+                    dmabuf_fd,
+                    width,
+                    height,
+                    DRM_FORMAT_XRGB8888,
+                    stride,
+                    0,
+                    actual_mod,
+                )
+                .expect("import_dmabuf_texture");
+            let dst_tex = egl
+                .create_cuda_target_texture(width, height)
+                .expect("create_cuda_target_texture");
+            let (cuda_res, cu_arr) = cuda
+                .register_gl_texture(dst_tex)
+                .expect("register_gl_texture");
+            let nvenc_res = nvenc
+                .register_cuda_frame(&CudaMappedFrame::Array(cu_arr))
+                .expect("register_cuda_frame");
+
+            let encode_one = |enc: &mut NvEncSession, idx: u64| -> Vec<u8> {
+                egl.blit_to_target(src_tex, dst_tex, width, height)
+                    .expect("blit_to_target");
+                cuda.map_resource(cuda_res).expect("map_resource");
+                let bs = enc
+                    .encode_registered_frame(nvenc_res, idx * 16_666, idx == 0)
+                    .expect("encode_registered_frame");
+                cuda.unmap_resource(cuda_res).expect("unmap_resource");
+                assert!(!bs.is_empty(), "Expected non-empty AV1 frame {}", idx);
+                bs
+            };
+
+            let _ = encode_one(&mut nvenc, 0);
+            nvenc
+                .reconfigure_bitrate(45_000)
+                .expect("reconfigure bitrate to 45000 kbps");
+            assert_eq!(nvenc.bitrate_kbps, 45_000);
+            let _ = encode_one(&mut nvenc, 1);
+            nvenc
+                .reconfigure_bitrate(12_000)
+                .expect("reconfigure bitrate to 12000 kbps");
+            assert_eq!(nvenc.bitrate_kbps, 12_000);
+            let _ = encode_one(&mut nvenc, 2);
 
             nvenc.unregister_resource(nvenc_res);
             cuda.unregister_resource(cuda_res);

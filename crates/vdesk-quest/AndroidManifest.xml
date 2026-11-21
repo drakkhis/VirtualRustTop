@@ -1,14 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  Reference Android manifest for VirtualRustTop (com.vdesk.quest).
+  Note: `cargo-apk` generates the packaged APK manifest from the
+  `[package.metadata.android]` table in `crates/vdesk-quest/Cargo.toml`.
+-->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="com.vdesk.quest"
     android:versionCode="1"
     android:versionName="0.1.0">
 
     <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" android:version="1" />
-    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="false" />
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="true" />
+    <uses-feature android:name="com.oculus.feature.BOUNDARYLESS_APP" android:required="true" />
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="com.oculus.permission.USE_SCENE" />
     <uses-permission android:name="com.oculus.permission.HAND_TRACKING" />
     <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
@@ -27,6 +35,8 @@
         android:allowBackup="false"
         android:hasCode="false"
         android:label="vdesk-rs">
+        <meta-data android:name="com.oculus.supportedDevices" android:value="quest2|questpro|quest3|quest3s" />
+        <meta-data android:name="com.oculus.ossplash.background" android:value="passthrough-contextual" />
         <activity
             android:name="android.app.NativeActivity"
             android:configChanges="density|keyboard|keyboardHidden|navigation|orientation|screenLayout|screenSize|uiMode"

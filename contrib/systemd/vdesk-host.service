@@ -1,0 +1,12 @@
+[Unit]
+Description=VirtualRustTop Quest 3 VR Desktop Host
+After=graphical-session.target pipewire.service wireplumber.service xdg-desktop-portal.service
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/vdesk-host
+Restart=on-failure
+RestartSec=3s
+
+[Install]
+WantedBy=graphical-session.target

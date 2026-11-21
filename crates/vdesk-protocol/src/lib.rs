@@ -59,12 +59,11 @@ pub enum ControlMessage {
     /// Sent by Quest when packet loss is detected or decoder resets
     RequestIdr { stream_id: u32 },
     /// Dynamic bitrate or curvature adjustment
-    UpdateBitrate {
-        stream_id: u32,
-        bitrate_kbps: u32,
-    },
+    UpdateBitrate { stream_id: u32, bitrate_kbps: u32 },
     /// Reliable, FIFO-ordered input event (keystrokes and mouse button edges)
     ReliableInput(InputEvent),
+    /// Sent by Quest when a monitor is hidden or shown in VR so the host can pause/resume streaming it.
+    SetStreamActive { stream_id: u32, active: bool },
 }
 
 /// High-frequency Video Frame Header prepended to QUIC stream or fragmented datagrams
@@ -81,11 +80,7 @@ pub struct VideoFrameHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum InputEvent {
     /// UV coordinates (0.0..=1.0) hit-tested on a specific monitor cylinder in VR
-    PointerMotionAbsolute {
-        stream_id: u32,
-        u: f32,
-        v: f32,
-    },
+    PointerMotionAbsolute { stream_id: u32, u: f32, v: f32 },
     /// Linux evdev button code (e.g., BTN_LEFT = 0x110, BTN_RIGHT = 0x111)
     PointerButton { button: u32, pressed: bool },
     /// Smooth 2D thumbstick scrolling
@@ -127,15 +122,15 @@ pub fn decode_audio_packet(bytes: &[u8]) -> Option<(AudioPacketHeader, Vec<i16>)
         return None;
     }
     let payload = &bytes[AUDIO_HEADER_LEN..];
-    if payload.len() % 2 != 0 {
+    if !payload.len().is_multiple_of(2) {
         return None;
     }
     let seq = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
     let sample_rate = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
     let channels = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
     let mut samples = Vec::with_capacity(payload.len() / 2);
-    for chunk in payload.chunks_exact(2) {
-        samples.push(i16::from_le_bytes([chunk[0], chunk[1]]));
+    for &chunk in payload.as_chunks::<2>().0 {
+        samples.push(i16::from_le_bytes(chunk));
     }
     Some((
         AudioPacketHeader {
@@ -168,5 +163,39 @@ mod tests {
         assert_eq!(decoded, pcm);
         assert!(decode_audio_packet(b"BAD!123456789012").is_none());
         assert!(decode_audio_packet(&pkt[..pkt.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn control_message_bitrate_and_active_roundtrip() {
+        let bitrate_msg = ControlMessage::UpdateBitrate {
+            stream_id: 94,
+            bitrate_kbps: 35_000,
+        };
+        let bytes = encode_message(&bitrate_msg).expect("encode UpdateBitrate");
+        let decoded: ControlMessage = decode_message(&bytes).expect("decode UpdateBitrate");
+        match decoded {
+            ControlMessage::UpdateBitrate {
+                stream_id,
+                bitrate_kbps,
+            } => {
+                assert_eq!(stream_id, 94);
+                assert_eq!(bitrate_kbps, 35_000);
+            }
+            other => panic!("Unexpected ControlMessage: {:?}", other),
+        }
+
+        let active_msg = ControlMessage::SetStreamActive {
+            stream_id: 92,
+            active: false,
+        };
+        let bytes = encode_message(&active_msg).expect("encode SetStreamActive");
+        let decoded: ControlMessage = decode_message(&bytes).expect("decode SetStreamActive");
+        match decoded {
+            ControlMessage::SetStreamActive { stream_id, active } => {
+                assert_eq!(stream_id, 92);
+                assert!(!active);
+            }
+            other => panic!("Unexpected ControlMessage: {:?}", other),
+        }
     }
 }

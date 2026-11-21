@@ -108,7 +108,8 @@ impl PointerStabilizer {
             let anchor = match self.lock {
                 LockState::PreClick { anchor } => anchor,
                 LockState::PostClick { anchor, until }
-                    if now <= until && dist_px(raw, anchor, mon_w, mon_h) <= POST_CLICK_DEADZONE_PX =>
+                    if now <= until
+                        && dist_px(raw, anchor, mon_w, mon_h) <= POST_CLICK_DEADZONE_PX =>
                 {
                     anchor
                 }
@@ -173,7 +174,8 @@ impl PointerStabilizer {
         };
 
         if let Some((prev_id, prev_uv)) = self.last_sent {
-            if prev_id == stream_id && dist_px(output_uv, prev_uv, mon_w, mon_h) < MIN_SEND_DELTA_PX {
+            if prev_id == stream_id && dist_px(output_uv, prev_uv, mon_w, mon_h) < MIN_SEND_DELTA_PX
+            {
                 return None;
             }
         }
@@ -206,7 +208,10 @@ mod tests {
         let t0 = Instant::now();
         let center = Vec2::new(0.5, 0.5);
 
-        assert_eq!(stab.update(1, center, W, H, 0.0, false, DT, t0), Some(center));
+        assert_eq!(
+            stab.update(1, center, W, H, 0.0, false, DT, t0),
+            Some(center)
+        );
 
         // Begin squeezing trigger past PRE_CLICK_ENGAGE (0.12) before full click
         let t1 = t0 + Duration::from_millis(11);
@@ -261,7 +266,10 @@ mod tests {
         let t0 = Instant::now();
         let anchor = Vec2::new(0.5, 0.5);
 
-        assert_eq!(stab.update(1, anchor, W, H, 0.0, false, DT, t0), Some(anchor));
+        assert_eq!(
+            stab.update(1, anchor, W, H, 0.0, false, DT, t0),
+            Some(anchor)
+        );
         let t1 = t0 + Duration::from_millis(11);
         assert_eq!(stab.update(1, anchor, W, H, 0.7, true, DT, t1), None);
         let t2 = t1 + Duration::from_millis(22);
@@ -292,7 +300,11 @@ mod tests {
                 max_dev_px = max_dev_px.max(((uv - center) * Vec2::new(W, H)).length());
             }
         }
-        assert!(max_dev_px < 2.0, "expected tremor < 2 px, got {}", max_dev_px);
+        assert!(
+            max_dev_px < 2.0,
+            "expected tremor < 2 px, got {}",
+            max_dev_px
+        );
 
         // Fast sweep (40 px per 90 Hz frame) scales cutoff up and tracks closely
         let mut latest = center;
@@ -305,6 +317,10 @@ mod tests {
             }
         }
         let lag_px = ((raw - latest) * Vec2::new(W, H)).length();
-        assert!(lag_px < 20.0, "expected fast sweep lag < 20 px, got {}", lag_px);
+        assert!(
+            lag_px < 20.0,
+            "expected fast sweep lag < 20 px, got {}",
+            lag_px
+        );
     }
 }

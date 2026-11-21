@@ -33,7 +33,11 @@ impl CylinderScreen {
         self.cylinder_from_world = world_from_cylinder.inverse();
     }
 
-    pub fn intersect_ray(&self, ray_origin_world: Vec3, ray_dir_world: Vec3) -> Option<(f32, Vec2)> {
+    pub fn intersect_ray(
+        &self,
+        ray_origin_world: Vec3,
+        ray_dir_world: Vec3,
+    ) -> Option<(f32, Vec2)> {
         let o = self.cylinder_from_world.transform_point3(ray_origin_world);
         let d = self
             .cylinder_from_world

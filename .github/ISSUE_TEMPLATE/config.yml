@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Pull Requests Welcome
+    url: https://github.com/drakkhis/VirtualRustTop/pulls
+    about: Want to add AMD/VA-API, Intel QuickSync, X11, or another headset/compositor? Open a PR!
